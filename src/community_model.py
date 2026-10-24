@@ -166,16 +166,23 @@ def solve_individual(com):
 
     return results
 
-def solve_community(com):
+def solve_community(com, use_cap=True, use_discount=True, member_tariffs=False):
     """Model C: community contract under central dispatch (direct control).
 
     One LP with all members: one meter, one cap, discounted tariffs and penalty at the connection point,
-    and an hourly internal balance behind the meter. Returns a dict with the community's hourly import,
-    export and import above the cap (kWh/h), each member's net consumption (kWh/h), the total cost (DKK)
-    and the dual of the internal balance (internal price, DKK/kWh).
+    and an hourly internal balance behind the meter.
+
+    Switches (for validation and variations):
+      use_cap        : False -> no cap at the connection point (no penalty either)
+      use_discount   : False -> full tariffs (beta = 0)
+      member_tariffs : True  -> tariffs charged on each member's own import/export, not on the community meter
+    With use_cap=False, use_discount=False, member_tariffs=True the model must reproduce model R.
+
+    Returns a dict with the community's hourly import, export and import above the cap (kWh/h),
+    each member's net consumption (kWh/h), the total cost (DKK) and the internal price (DKK/kWh).
     Choice: kWh above the cap pay price + penalty, no tariff (same as model I).
     """
-    beta = com.contract.tariff_discount_ratio
+    beta = com.contract.tariff_discount_ratio if use_discount else 0.0
     alpha = com.contract.penalty_DKK_per_kWh
     cap = com.contract.capacity_limit_kW
     p, tau_imp, tau_exp = com.energy_price, com.import_tariff, com.export_tariff
@@ -190,26 +197,38 @@ def solve_community(com):
         v, c, net, own_cost = add_member(m, d, d.consumer_id)
         nets[d.consumer_id] = net
         own_costs += own_cost
+    ids = list(nets)
 
     # Exchange at the community's connection point
     P_below = m.addVars(T, lb=0, name="P_below")   # import within the cap (kWh/h)
     P_above = m.addVars(T, lb=0, name="P_above")   # import above the cap (kWh/h)
     P_exp = m.addVars(T, lb=0, name="P_exp")       # export (kWh/h)
 
-    m.addConstrs((P_below[t] <= cap[t] for t in T), name="cap")
+    if use_cap:
+        m.addConstrs((P_below[t] <= cap[t] for t in T), name="cap")
+    else:
+        m.addConstrs((P_above[t] == 0 for t in T), name="no_cap")   # all import counted in P_below, no penalty
 
     # Internal balance: what the meter imports - exports = sum of the members' net consumption
     balance = m.addConstrs(
-        (P_below[t] + P_above[t] - P_exp[t] == gp.quicksum(nets[i][t] for i in nets) for t in T),
+        (P_below[t] + P_above[t] - P_exp[t] == gp.quicksum(nets[i][t] for i in ids) for t in T),
         name="internal_balance")
 
-    m.setObjective(
-        gp.quicksum(
-            (p[t] + (1 - beta) * tau_imp) * P_below[t]
-            + (p[t] + alpha) * P_above[t]
-            - (p[t] - (1 - beta) * tau_exp) * P_exp[t]
-            for t in T) + own_costs,
-        GRB.MINIMIZE)
+    # Grid tariffs: on the community meter (contract) or on each member's own meter (validation)
+    if member_tariffs:
+        q_imp = m.addVars(ids, T, lb=0, name="q_imp")   # member import (kWh/h)
+        q_exp = m.addVars(ids, T, lb=0, name="q_exp")   # member export (kWh/h)
+        m.addConstrs((q_imp[i, t] - q_exp[i, t] == nets[i][t] for i in ids for t in T), name="member_balance")
+        m.addConstrs((P_below[t] + P_above[t] == q_imp.sum("*", t) for t in T), name="sum_imports")
+        m.addConstrs((P_exp[t] == q_exp.sum("*", t) for t in T), name="sum_exports")
+        tariffs = gp.quicksum((1 - beta) * (tau_imp * q_imp[i, t] + tau_exp * q_exp[i, t]) for i in ids for t in T)
+    else:
+        tariffs = gp.quicksum((1 - beta) * (tau_imp * P_below[t] + tau_exp * P_exp[t]) for t in T)
+
+    energy = gp.quicksum(p[t] * (P_below[t] + P_above[t] - P_exp[t]) for t in T)
+    penalty = gp.quicksum(alpha * P_above[t] for t in T)
+
+    m.setObjective(energy + tariffs + penalty + own_costs, GRB.MINIMIZE)
 
     m.optimize()
     if m.Status != GRB.OPTIMAL:
@@ -220,7 +239,7 @@ def solve_community(com):
         "imp": np.array([P_below[t].X for t in T]) + above,
         "exp": np.array([P_exp[t].X for t in T]),
         "above": above,
-        "net": {i: np.array([nets[i][t].getValue() for t in T]) for i in nets},
+        "net": {i: np.array([nets[i][t].getValue() for t in T]) for i in ids},
         "cost": m.ObjVal,
         "price": np.array([balance[t].Pi for t in T]),   # internal price lambda_t (DKK/kWh)
     }
@@ -250,3 +269,11 @@ if __name__ == "__main__":
         print("  Hours above community cap:", int((P_imp > cap + 1e-6).sum()))
 
     print("Internal price C (DKK/kWh):", np.round(res_C["price"], 2))
+
+    # Validation: C without cap, without discount and with member tariffs must reproduce R
+    res_C_val = solve_community(com, use_cap=False, use_discount=False, member_tariffs=True)
+    cost_R = sum(r["cost"] for r in res_R.values())
+    print("--- Validation ---")
+    print("  Cost R (DKK):", round(cost_R, 2))
+    print("  Cost C, no cap / no discount / member tariffs (DKK):", round(res_C_val["cost"], 2))
+    print("  Difference (DKK):", round(res_C_val["cost"] - cost_R, 6))
