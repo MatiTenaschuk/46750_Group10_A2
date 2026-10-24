@@ -75,205 +75,163 @@ def add_member(m, d, tag):
     
     return v, c, net, own_cost
 
-def solve_reference(com):
-    """Model R: every member alone, no contract, full tariffs.
+class CommunityModel:
+    """One parametrized model for the three setups of Question 1.
 
-    Solves one LP per member and returns a dict {consumer_id: results},
-    where results holds the hourly import/export (kWh/h) and the total cost (DKK).
+    Switches:
+      meter        : "member"    -> each member has its own meter (tariffs, cap and penalty on its own flows)
+                     "community" -> one meter for the whole community (tariffs, cap and penalty on the aggregate)
+      use_cap      : True -> cap at each meter (individual caps if meter="member"), penalty above it
+      use_discount : True -> discounted tariffs (1 - beta), False -> full tariffs
+
+    Named configurations:
+      R = member meter, no cap, no discount        (no contract)
+      I = member meter, individual caps, discount  (individual contracts)
+      C = community meter, community cap, discount (community contract, central dispatch)
     """
-    results = {}
 
-    for d in com.members:
-        T = range(d.n_hours)
-        m = gp.Model(f"R_{d.consumer_id}")
-        m.Params.OutputFlag = 0          # silence the Gurobi log
+    def __init__(self, com, meter="community", use_cap=True, use_discount=True, name="C", verbose=False):
+        if meter not in ("member", "community"):
+            raise ValueError("meter must be 'member' or 'community'")
+        self.com = com                      # CommunityData (members + contract)
+        self.meter = meter
+        self.use_cap = use_cap
+        self.use_discount = use_discount
+        self.name = name                    # label of the configuration ("R", "I", "C", ...)
+        self.verbose = verbose              # True -> show the Gurobi log
+        self.T = range(len(com.energy_price))
+        self.ids = com.member_ids
 
-        v, c, net, own_cost = add_member(m, d, d.consumer_id)
+    # --- Named configurations ------------------------------------------------------------------
+    @classmethod
+    def R(cls, com):
+        """No contract: every member alone, full tariffs, no cap."""
+        return cls(com, meter="member", use_cap=False, use_discount=False, name="R")
 
-        # Grid exchange on the member's own meter
-        q_imp = m.addVars(T, lb=0, name="q_imp")
-        q_exp = m.addVars(T, lb=0, name="q_exp")
-        m.addConstrs((q_imp[t] - q_exp[t] == net[t] for t in T), name="balance")
+    @classmethod
+    def I(cls, com):
+        """Individual contracts: every member alone, own cap, discounted tariffs, penalty."""
+        return cls(com, meter="member", use_cap=True, use_discount=True, name="I")
 
-        # Objective: full tariffs on import and export, plus own cost
-        p, tau_imp, tau_exp = d.energy_price, d.import_tariff, d.export_tariff
-        m.setObjective(
-            gp.quicksum((p[t] + tau_imp) * q_imp[t] - (p[t] - tau_exp) * q_exp[t] for t in T) + own_cost,
-            GRB.MINIMIZE)
+    @classmethod
+    def C(cls, com):
+        """Community contract under central dispatch: one meter, one cap, discounted tariffs, penalty."""
+        return cls(com, meter="community", use_cap=True, use_discount=True, name="C")
 
-        m.optimize()
-        if m.Status != GRB.OPTIMAL:
-            raise RuntimeError(f"Model R, member {d.consumer_id}: not optimal (status {m.Status})")
+    # --- Model building ------------------------------------------------------------------------
+    def build(self):
+        """Create the Gurobi model and add all members (variables, constraints, net consumption, own cost)."""
+        self.m = gp.Model(self.name)
+        self.m.Params.OutputFlag = int(self.verbose)
 
-        results[d.consumer_id] = {
-            "imp": np.array([q_imp[t].X for t in T]),
-            "exp": np.array([q_exp[t].X for t in T]),
-            "cost": m.ObjVal,
+        self.net, self.own_cost = {}, {}
+        for d in self.com.members:
+            v, c, net, own_cost = add_member(self.m, d, d.consumer_id)
+            self.net[d.consumer_id] = net
+            self.own_cost[d.consumer_id] = own_cost
+        # --- Meters: one per member (R, I) or one for the community (C) --------------------------
+        T, ids, contract = self.T, self.ids, self.com.contract
+        if self.meter == "member":
+            self.meters = ids
+            cap = {i: contract.individual_capacity_limit_kW[i] for i in ids}
+            flow = {i: self.net[i] for i in ids}
+        else:
+            self.meters = ["community"]
+            cap = {"community": contract.capacity_limit_kW}
+            flow = {"community": [gp.quicksum(self.net[i][t] for i in ids) for t in T]}
+
+        # Exchange with the grid at every meter (kWh/h)
+        self.q_below = self.m.addVars(self.meters, T, lb=0, name="q_below")   # import within the cap
+        self.q_above = self.m.addVars(self.meters, T, lb=0, name="q_above")   # import above the cap (penalized)
+        self.q_exp = self.m.addVars(self.meters, T, lb=0, name="q_exp")       # export
+
+        # Cap: limit the import within the cap; without cap, nothing can be "above"
+        if self.use_cap:
+            self.m.addConstrs((self.q_below[k, t] <= cap[k][t] for k in self.meters for t in T), name="cap")
+        else:
+            self.m.addConstrs((self.q_above[k, t] == 0 for k in self.meters for t in T), name="no_cap")
+
+        # Balance at every meter: import - export = flow behind the meter
+        # (for C: the internal balance, whose dual is the internal price)
+        self.balance = self.m.addConstrs(
+            (self.q_below[k, t] + self.q_above[k, t] - self.q_exp[k, t] == flow[k][t]
+             for k in self.meters for t in T),
+            name="balance")
+        # --- Objective: what every meter pays to the DSO + every member's own cost ----------------
+        beta = contract.tariff_discount_ratio if self.use_discount else 0.0
+        alpha = contract.penalty_DKK_per_kWh
+        p, tau_imp, tau_exp = self.com.energy_price, self.com.import_tariff, self.com.export_tariff
+
+        # Payment of each meter (DKK). Choice: kWh above the cap pay price + penalty, no tariff
+        self.cost_meter = {
+            k: gp.quicksum(
+                (p[t] + (1 - beta) * tau_imp) * self.q_below[k, t]
+                + (p[t] + alpha) * self.q_above[k, t]
+                - (p[t] - (1 - beta) * tau_exp) * self.q_exp[k, t]
+                for t in T)
+            for k in self.meters}
+
+        self.m.setObjective(
+            gp.quicksum(self.cost_meter.values()) + gp.quicksum(self.own_cost.values()), GRB.MINIMIZE)
+
+
+        return self
+
+
+    # --- Solving and results ---------------------------------------------------------------------
+    def solve(self):
+        """Build (if needed) and solve the model. Returns a dict with the same keys for R, I and C:
+          model, cost (DKK), P_imp / P_exp / above (aggregated, kWh/h), net (per member, kWh/h),
+          own_cost (per member, DKK); member_cost (per member, DKK) when meter="member";
+          price (internal price, DKK/kWh) when meter="community".
+        """
+        if not hasattr(self, "m"):
+            self.build()
+        self.m.optimize()
+        if self.m.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Model {self.name}: not optimal (status {self.m.Status})")
+
+        T, ids = self.T, self.ids
+        res = {
+            "model": self.name,
+            "cost": self.m.ObjVal,
+            "P_imp": np.array([sum(self.q_below[k, t].X + self.q_above[k, t].X for k in self.meters) for t in T]),
+            "P_exp": np.array([sum(self.q_exp[k, t].X for k in self.meters) for t in T]),
+            "above": np.array([sum(self.q_above[k, t].X for k in self.meters) for t in T]),
+            "net": {i: np.array([self.net[i][t].getValue() for t in T]) for i in ids},
+            "own_cost": {i: self.own_cost[i].getValue() for i in ids},
         }
-
-    return results
-
-
-def solve_individual(com):
-    """Model I: every member signs its own contract (individual cap, discounted tariffs, penalty).
-
-    Solves one LP per member and returns a dict {consumer_id: results},
-    with the hourly import/export (kWh/h), the import above the own cap (kWh/h) and the total cost (DKK).
-    Choice: kWh above the cap pay price + penalty, no tariff (assignment text).
-    """
-    beta = com.contract.tariff_discount_ratio            # 0.75
-    alpha = com.contract.penalty_DKK_per_kWh             # 10 DKK/kWh
-    results = {}
-
-    for d in com.members:
-        T = range(d.n_hours)
-        cap_i = com.contract.individual_capacity_limit_kW[d.consumer_id]   # 24 values, kW
-
-        m = gp.Model(f"I_{d.consumer_id}")
-        m.Params.OutputFlag = 0
-
-        v, c, net, own_cost = add_member(m, d, d.consumer_id)
-
-        # Import split in two parts: within the own cap and above it
-        q_below = m.addVars(T, lb=0, name="q_below")     # import within the cap (kWh/h)
-        q_above = m.addVars(T, lb=0, name="q_above")     # import above the cap (kWh/h)
-        q_exp = m.addVars(T, lb=0, name="q_exp")         # export (kWh/h)
-
-        m.addConstrs((q_below[t] <= cap_i[t] for t in T), name="own_cap")
-        m.addConstrs((q_below[t] + q_above[t] - q_exp[t] == net[t] for t in T), name="balance")
-
-        # Objective: discounted tariffs below the cap and on export, penalty above the cap
-        p, tau_imp, tau_exp = d.energy_price, d.import_tariff, d.export_tariff
-        m.setObjective(
-            gp.quicksum(
-                (p[t] + (1 - beta) * tau_imp) * q_below[t]
-                + (p[t] + alpha) * q_above[t]
-                - (p[t] - (1 - beta) * tau_exp) * q_exp[t]
-                for t in T) + own_cost,
-            GRB.MINIMIZE)
-
-        m.optimize()
-        if m.Status != GRB.OPTIMAL:
-            raise RuntimeError(f"Model I, member {d.consumer_id}: not optimal (status {m.Status})")
-
-        above = np.array([q_above[t].X for t in T])
-        results[d.consumer_id] = {
-            "imp": np.array([q_below[t].X for t in T]) + above,
-            "exp": np.array([q_exp[t].X for t in T]),
-            "above": above,
-            "cost": m.ObjVal,
-        }
-
-    return results
-
-def solve_community(com, use_cap=True, use_discount=True, member_tariffs=False):
-    """Model C: community contract under central dispatch (direct control).
-
-    One LP with all members: one meter, one cap, discounted tariffs and penalty at the connection point,
-    and an hourly internal balance behind the meter.
-
-    Switches (for validation and variations):
-      use_cap        : False -> no cap at the connection point (no penalty either)
-      use_discount   : False -> full tariffs (beta = 0)
-      member_tariffs : True  -> tariffs charged on each member's own import/export, not on the community meter
-    With use_cap=False, use_discount=False, member_tariffs=True the model must reproduce model R.
-
-    Returns a dict with the community's hourly import, export and import above the cap (kWh/h),
-    each member's net consumption (kWh/h), the total cost (DKK) and the internal price (DKK/kWh).
-    Choice: kWh above the cap pay price + penalty, no tariff (same as model I).
-    """
-    beta = com.contract.tariff_discount_ratio if use_discount else 0.0
-    alpha = com.contract.penalty_DKK_per_kWh
-    cap = com.contract.capacity_limit_kW
-    p, tau_imp, tau_exp = com.energy_price, com.import_tariff, com.export_tariff
-    T = range(len(p))
-
-    m = gp.Model("C")
-    m.Params.OutputFlag = 0
-
-    # All members in the same model
-    nets, own_costs = {}, 0
-    for d in com.members:
-        v, c, net, own_cost = add_member(m, d, d.consumer_id)
-        nets[d.consumer_id] = net
-        own_costs += own_cost
-    ids = list(nets)
-
-    # Exchange at the community's connection point
-    P_below = m.addVars(T, lb=0, name="P_below")   # import within the cap (kWh/h)
-    P_above = m.addVars(T, lb=0, name="P_above")   # import above the cap (kWh/h)
-    P_exp = m.addVars(T, lb=0, name="P_exp")       # export (kWh/h)
-
-    if use_cap:
-        m.addConstrs((P_below[t] <= cap[t] for t in T), name="cap")
-    else:
-        m.addConstrs((P_above[t] == 0 for t in T), name="no_cap")   # all import counted in P_below, no penalty
-
-    # Internal balance: what the meter imports - exports = sum of the members' net consumption
-    balance = m.addConstrs(
-        (P_below[t] + P_above[t] - P_exp[t] == gp.quicksum(nets[i][t] for i in ids) for t in T),
-        name="internal_balance")
-
-    # Grid tariffs: on the community meter (contract) or on each member's own meter (validation)
-    if member_tariffs:
-        q_imp = m.addVars(ids, T, lb=0, name="q_imp")   # member import (kWh/h)
-        q_exp = m.addVars(ids, T, lb=0, name="q_exp")   # member export (kWh/h)
-        m.addConstrs((q_imp[i, t] - q_exp[i, t] == nets[i][t] for i in ids for t in T), name="member_balance")
-        m.addConstrs((P_below[t] + P_above[t] == q_imp.sum("*", t) for t in T), name="sum_imports")
-        m.addConstrs((P_exp[t] == q_exp.sum("*", t) for t in T), name="sum_exports")
-        tariffs = gp.quicksum((1 - beta) * (tau_imp * q_imp[i, t] + tau_exp * q_exp[i, t]) for i in ids for t in T)
-    else:
-        tariffs = gp.quicksum((1 - beta) * (tau_imp * P_below[t] + tau_exp * P_exp[t]) for t in T)
-
-    energy = gp.quicksum(p[t] * (P_below[t] + P_above[t] - P_exp[t]) for t in T)
-    penalty = gp.quicksum(alpha * P_above[t] for t in T)
-
-    m.setObjective(energy + tariffs + penalty + own_costs, GRB.MINIMIZE)
-
-    m.optimize()
-    if m.Status != GRB.OPTIMAL:
-        raise RuntimeError(f"Model C: not optimal (status {m.Status})")
-
-    above = np.array([P_above[t].X for t in T])
-    return {
-        "imp": np.array([P_below[t].X for t in T]) + above,
-        "exp": np.array([P_exp[t].X for t in T]),
-        "above": above,
-        "net": {i: np.array([nets[i][t].getValue() for t in T]) for i in ids},
-        "cost": m.ObjVal,
-        "price": np.array([balance[t].Pi for t in T]),   # internal price lambda_t (DKK/kWh)
-    }
+        if self.meter == "member":
+            # Each member pays its own meter: total cost of each member
+            res["member_cost"] = {i: self.cost_meter[i].getValue() + res["own_cost"][i] for i in ids}
+        else:
+            # Dual of the internal balance: the internal price of central dispatch
+            res["price"] = np.array([self.balance["community", t].Pi for t in T])
+        return res
 
 
 if __name__ == "__main__":
     com = load_community("base", day="d1")
     cap = com.contract.capacity_limit_kW
 
-    res_R = solve_reference(com)
-    res_I = solve_individual(com)
-    res_C = solve_community(com)
+    results = {f.__name__: f(com).solve() for f in (CommunityModel.R, CommunityModel.I, CommunityModel.C)}
 
-    # Same structure for the three models: aggregated import and total cost
-    summary = {
-        "R": (sum(r["imp"] for r in res_R.values()), sum(r["cost"] for r in res_R.values())),
-        "I": (sum(r["imp"] for r in res_I.values()), sum(r["cost"] for r in res_I.values())),
-        "C": (res_C["imp"], res_C["cost"]),
-    }
-
-    for name, (P_imp, cost) in summary.items():
+    for name, res in results.items():
+        P_imp = res["P_imp"]
         print(f"--- Model {name} ---")
         print("  Daily import (kWh):", round(P_imp.sum(), 2))
         print("  Peak import (kW):", round(P_imp.max(), 2))
-        print("  Total cost (DKK):", round(cost, 2))
+        print("  Total cost (DKK):", round(res["cost"], 2))
         print("  Exceedance of community cap (kWh):", round(np.maximum(P_imp - cap, 0).sum(), 2))
         print("  Hours above community cap:", int((P_imp > cap + 1e-6).sum()))
 
-    print("Internal price C (DKK/kWh):", np.round(res_C["price"], 2))
+    print("Internal price C (DKK/kWh):", np.round(results["C"]["price"], 2))
 
-    # Validation: C without cap, without discount and with member tariffs must reproduce R
-    res_C_val = solve_community(com, use_cap=False, use_discount=False, member_tariffs=True)
-    cost_R = sum(r["cost"] for r in res_R.values())
+    # Validation: the direct-control model with member meters, no cap and no discount (= configuration R)
+    # must reproduce the reference values of the contract file
     print("--- Validation ---")
-    print("  Cost R (DKK):", round(cost_R, 2))
-    print("  Cost C, no cap / no discount / member tariffs (DKK):", round(res_C_val["cost"], 2))
-    print("  Difference (DKK):", round(res_C_val["cost"] - cost_R, 6))
+    print("  Model R:", {"daily_import_kWh": round(results["R"]["P_imp"].sum(), 2),
+                         "peak_import_kW": round(results["R"]["P_imp"].max(), 2),
+                         "cost_DKK": round(results["R"]["cost"], 2)})
+    print("  File   :", com.contract.reference_model_R)
+    
