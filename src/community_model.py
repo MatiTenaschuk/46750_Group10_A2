@@ -75,30 +75,55 @@ def add_member(m, d, tag):
     
     return v, c, net, own_cost
 
+def solve_reference(com):
+    """Model R: every member alone, no contract, full tariffs.
+
+    Solves one LP per member and returns a dict {consumer_id: results},
+    where results holds the hourly import/export (kWh/h) and the total cost (DKK).
+    """
+    results = {}
+
+    for d in com.members:
+        T = range(d.n_hours)
+        m = gp.Model(f"R_{d.consumer_id}")
+        m.Params.OutputFlag = 0          # silence the Gurobi log
+
+        v, c, net, own_cost = add_member(m, d, d.consumer_id)
+
+        # Grid exchange on the member's own meter
+        q_imp = m.addVars(T, lb=0, name="q_imp")
+        q_exp = m.addVars(T, lb=0, name="q_exp")
+        m.addConstrs((q_imp[t] - q_exp[t] == net[t] for t in T), name="balance")
+
+        # Objective: full tariffs on import and export, plus own cost
+        p, tau_imp, tau_exp = d.energy_price, d.import_tariff, d.export_tariff
+        m.setObjective(
+            gp.quicksum((p[t] + tau_imp) * q_imp[t] - (p[t] - tau_exp) * q_exp[t] for t in T) + own_cost,
+            GRB.MINIMIZE)
+
+        m.optimize()
+        if m.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Model R, member {d.consumer_id}: not optimal (status {m.Status})")
+
+        results[d.consumer_id] = {
+            "imp": np.array([q_imp[t].X for t in T]),
+            "exp": np.array([q_exp[t].X for t in T]),
+            "cost": m.ObjVal,
+        }
+
+    return results
 
 if __name__ == "__main__":
     com = load_community("base", day="d1")
-    d = com.members[2]   # C1_B (has a battery)
-    T = range(d.n_hours)
+    res_R = solve_reference(com)
 
-    m = gp.Model("R_test")
-    v, c, net, own_cost = add_member(m, d, d.consumer_id)
+    # Aggregated import at the connection point (what the DSO sees)
+    P_imp = sum(r["imp"] for r in res_R.values())
+    cap = com.contract.capacity_limit_kW
 
-    # Grid exchange of the member (model R: its own meter, full tariffs)
-    q_imp = m.addVars(T, lb=0, name="q_imp")   # import (kWh/h)
-    q_exp = m.addVars(T, lb=0, name="q_exp")   # export (kWh/h)
-
-    # Balance: import - export = net consumption
-    m.addConstrs((q_imp[t] - q_exp[t] == net[t] for t in T), name="balance")
-
-    # Objective: buy at price + import tariff, sell at price - export tariff, plus own cost
-    p, tau_imp, tau_exp = d.energy_price, d.import_tariff, d.export_tariff
-    m.setObjective(
-        gp.quicksum((p[t] + tau_imp) * q_imp[t] - (p[t] - tau_exp) * q_exp[t] for t in T) + own_cost,
-        GRB.MINIMIZE)
-
-    m.optimize()
-
-    print("Status optimal:", m.Status == GRB.OPTIMAL)
-    print("Total cost (DKK):", round(m.ObjVal, 2))
-    print("Net import (kWh):", round(sum(q_imp[t].X - q_exp[t].X for t in T), 2))
+    print("Daily import (kWh):", round(P_imp.sum(), 2))
+    print("Peak import (kW):", round(P_imp.max(), 2))
+    print("Total cost (DKK):", round(sum(r["cost"] for r in res_R.values()), 2))
+    print("Exceedance (kWh):", round(np.maximum(P_imp - cap, 0).sum(), 2))
+    print("Hours above cap:", int((P_imp > cap).sum()))
+    print("Reference values:", com.contract.reference_model_R)
