@@ -166,18 +166,87 @@ def solve_individual(com):
 
     return results
 
+def solve_community(com):
+    """Model C: community contract under central dispatch (direct control).
 
+    One LP with all members: one meter, one cap, discounted tariffs and penalty at the connection point,
+    and an hourly internal balance behind the meter. Returns a dict with the community's hourly import,
+    export and import above the cap (kWh/h), each member's net consumption (kWh/h), the total cost (DKK)
+    and the dual of the internal balance (internal price, DKK/kWh).
+    Choice: kWh above the cap pay price + penalty, no tariff (same as model I).
+    """
+    beta = com.contract.tariff_discount_ratio
+    alpha = com.contract.penalty_DKK_per_kWh
+    cap = com.contract.capacity_limit_kW
+    p, tau_imp, tau_exp = com.energy_price, com.import_tariff, com.export_tariff
+    T = range(len(p))
+
+    m = gp.Model("C")
+    m.Params.OutputFlag = 0
+
+    # All members in the same model
+    nets, own_costs = {}, 0
+    for d in com.members:
+        v, c, net, own_cost = add_member(m, d, d.consumer_id)
+        nets[d.consumer_id] = net
+        own_costs += own_cost
+
+    # Exchange at the community's connection point
+    P_below = m.addVars(T, lb=0, name="P_below")   # import within the cap (kWh/h)
+    P_above = m.addVars(T, lb=0, name="P_above")   # import above the cap (kWh/h)
+    P_exp = m.addVars(T, lb=0, name="P_exp")       # export (kWh/h)
+
+    m.addConstrs((P_below[t] <= cap[t] for t in T), name="cap")
+
+    # Internal balance: what the meter imports - exports = sum of the members' net consumption
+    balance = m.addConstrs(
+        (P_below[t] + P_above[t] - P_exp[t] == gp.quicksum(nets[i][t] for i in nets) for t in T),
+        name="internal_balance")
+
+    m.setObjective(
+        gp.quicksum(
+            (p[t] + (1 - beta) * tau_imp) * P_below[t]
+            + (p[t] + alpha) * P_above[t]
+            - (p[t] - (1 - beta) * tau_exp) * P_exp[t]
+            for t in T) + own_costs,
+        GRB.MINIMIZE)
+
+    m.optimize()
+    if m.Status != GRB.OPTIMAL:
+        raise RuntimeError(f"Model C: not optimal (status {m.Status})")
+
+    above = np.array([P_above[t].X for t in T])
+    return {
+        "imp": np.array([P_below[t].X for t in T]) + above,
+        "exp": np.array([P_exp[t].X for t in T]),
+        "above": above,
+        "net": {i: np.array([nets[i][t].getValue() for t in T]) for i in nets},
+        "cost": m.ObjVal,
+        "price": np.array([balance[t].Pi for t in T]),   # internal price lambda_t (DKK/kWh)
+    }
 
 
 if __name__ == "__main__":
     com = load_community("base", day="d1")
     cap = com.contract.capacity_limit_kW
 
-    for name, res in [("R", solve_reference(com)), ("I", solve_individual(com))]:
-        P_imp = sum(r["imp"] for r in res.values())   # aggregated import (what the DSO sees)
+    res_R = solve_reference(com)
+    res_I = solve_individual(com)
+    res_C = solve_community(com)
+
+    # Same structure for the three models: aggregated import and total cost
+    summary = {
+        "R": (sum(r["imp"] for r in res_R.values()), sum(r["cost"] for r in res_R.values())),
+        "I": (sum(r["imp"] for r in res_I.values()), sum(r["cost"] for r in res_I.values())),
+        "C": (res_C["imp"], res_C["cost"]),
+    }
+
+    for name, (P_imp, cost) in summary.items():
         print(f"--- Model {name} ---")
         print("  Daily import (kWh):", round(P_imp.sum(), 2))
         print("  Peak import (kW):", round(P_imp.max(), 2))
-        print("  Total cost (DKK):", round(sum(r["cost"] for r in res.values()), 2))
+        print("  Total cost (DKK):", round(cost, 2))
         print("  Exceedance of community cap (kWh):", round(np.maximum(P_imp - cap, 0).sum(), 2))
         print("  Hours above community cap:", int((P_imp > cap + 1e-6).sum()))
+
+    print("Internal price C (DKK/kWh):", np.round(res_C["price"], 2))
