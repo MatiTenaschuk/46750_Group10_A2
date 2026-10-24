@@ -113,17 +113,71 @@ def solve_reference(com):
 
     return results
 
+
+def solve_individual(com):
+    """Model I: every member signs its own contract (individual cap, discounted tariffs, penalty).
+
+    Solves one LP per member and returns a dict {consumer_id: results},
+    with the hourly import/export (kWh/h), the import above the own cap (kWh/h) and the total cost (DKK).
+    Choice: kWh above the cap pay price + penalty, no tariff (assignment text).
+    """
+    beta = com.contract.tariff_discount_ratio            # 0.75
+    alpha = com.contract.penalty_DKK_per_kWh             # 10 DKK/kWh
+    results = {}
+
+    for d in com.members:
+        T = range(d.n_hours)
+        cap_i = com.contract.individual_capacity_limit_kW[d.consumer_id]   # 24 values, kW
+
+        m = gp.Model(f"I_{d.consumer_id}")
+        m.Params.OutputFlag = 0
+
+        v, c, net, own_cost = add_member(m, d, d.consumer_id)
+
+        # Import split in two parts: within the own cap and above it
+        q_below = m.addVars(T, lb=0, name="q_below")     # import within the cap (kWh/h)
+        q_above = m.addVars(T, lb=0, name="q_above")     # import above the cap (kWh/h)
+        q_exp = m.addVars(T, lb=0, name="q_exp")         # export (kWh/h)
+
+        m.addConstrs((q_below[t] <= cap_i[t] for t in T), name="own_cap")
+        m.addConstrs((q_below[t] + q_above[t] - q_exp[t] == net[t] for t in T), name="balance")
+
+        # Objective: discounted tariffs below the cap and on export, penalty above the cap
+        p, tau_imp, tau_exp = d.energy_price, d.import_tariff, d.export_tariff
+        m.setObjective(
+            gp.quicksum(
+                (p[t] + (1 - beta) * tau_imp) * q_below[t]
+                + (p[t] + alpha) * q_above[t]
+                - (p[t] - (1 - beta) * tau_exp) * q_exp[t]
+                for t in T) + own_cost,
+            GRB.MINIMIZE)
+
+        m.optimize()
+        if m.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Model I, member {d.consumer_id}: not optimal (status {m.Status})")
+
+        above = np.array([q_above[t].X for t in T])
+        results[d.consumer_id] = {
+            "imp": np.array([q_below[t].X for t in T]) + above,
+            "exp": np.array([q_exp[t].X for t in T]),
+            "above": above,
+            "cost": m.ObjVal,
+        }
+
+    return results
+
+
+
+
 if __name__ == "__main__":
     com = load_community("base", day="d1")
-    res_R = solve_reference(com)
-
-    # Aggregated import at the connection point (what the DSO sees)
-    P_imp = sum(r["imp"] for r in res_R.values())
     cap = com.contract.capacity_limit_kW
 
-    print("Daily import (kWh):", round(P_imp.sum(), 2))
-    print("Peak import (kW):", round(P_imp.max(), 2))
-    print("Total cost (DKK):", round(sum(r["cost"] for r in res_R.values()), 2))
-    print("Exceedance (kWh):", round(np.maximum(P_imp - cap, 0).sum(), 2))
-    print("Hours above cap:", int((P_imp > cap).sum()))
-    print("Reference values:", com.contract.reference_model_R)
+    for name, res in [("R", solve_reference(com)), ("I", solve_individual(com))]:
+        P_imp = sum(r["imp"] for r in res.values())   # aggregated import (what the DSO sees)
+        print(f"--- Model {name} ---")
+        print("  Daily import (kWh):", round(P_imp.sum(), 2))
+        print("  Peak import (kW):", round(P_imp.max(), 2))
+        print("  Total cost (DKK):", round(sum(r["cost"] for r in res.values()), 2))
+        print("  Exceedance of community cap (kWh):", round(np.maximum(P_imp - cap, 0).sum(), 2))
+        print("  Hours above community cap:", int((P_imp > cap + 1e-6).sum()))
