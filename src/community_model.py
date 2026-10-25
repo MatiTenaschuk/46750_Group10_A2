@@ -1,7 +1,7 @@
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
-
+from src.plotting import plot_import_vs_cap
 from src.data_loader import load_community
 
 def add_member(m, d, tag):
@@ -284,3 +284,7 @@ if __name__ == "__main__":
     for name, res in results.items():
         parts = res["cost_energy"] + res["cost_tariffs"] + res["cost_penalty"] + res["cost_own"]
         print(f"  {name}: total {res['cost']:.2f} | sum of parts {parts:.2f}")
+
+      # Figure: import against the cap and internal price
+    plot_import_vs_cap(results, com, "results/q1/import_vs_cap")
+    print("Figure saved in results/q1/")
