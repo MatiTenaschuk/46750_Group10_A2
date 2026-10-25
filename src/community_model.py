@@ -162,6 +162,8 @@ class CommunityModel:
         alpha = contract.penalty_DKK_per_kWh
         p, tau_imp, tau_exp = self.com.energy_price, self.com.import_tariff, self.com.export_tariff
 
+        self.beta, self.alpha = beta, alpha   # kept for the cost breakdown in solve()
+
         # Payment of each meter (DKK). Choice: kWh above the cap pay price + penalty, no tariff
         self.cost_meter = {
             k: gp.quicksum(
@@ -201,6 +203,17 @@ class CommunityModel:
             "net": {i: np.array([self.net[i][t].getValue() for t in T]) for i in ids},
             "own_cost": {i: self.own_cost[i].getValue() for i in ids},
         }
+
+
+        # Cost breakdown (DKK): energy at the day-ahead price, grid tariffs, cap penalty, own cost (PV + disutility)
+        p, tau_imp, tau_exp = self.com.energy_price, self.com.import_tariff, self.com.export_tariff
+        imp_below = np.array([sum(self.q_below[k, t].X for k in self.meters) for t in T])
+        res["cost_energy"] = float(p @ (res["P_imp"] - res["P_exp"]))
+        res["cost_tariffs"] = float((1 - self.beta) * (tau_imp * imp_below.sum() + tau_exp * res["P_exp"].sum()))
+        res["cost_penalty"] = float(self.alpha * res["above"].sum())
+        res["cost_own"] = float(sum(res["own_cost"].values()))
+
+
         if self.meter == "member":
             # Each member pays its own meter: total cost of each member
             res["member_cost"] = {i: self.cost_meter[i].getValue() + res["own_cost"][i] for i in ids}
@@ -209,29 +222,65 @@ class CommunityModel:
             res["price"] = np.array([self.balance["community", t].Pi for t in T])
         return res
 
+def compute_metrics(res, res_R, cap):
+    """Metrics of one model against the reference model R (no contract).
 
+    res   : result of CommunityModel.solve() for the model evaluated
+    res_R : result of CommunityModel.R(com).solve() (the reference)
+    cap   : community cap (kW, 24 values)
+
+    Community point of view:
+      contract_value      = cost_R - cost (DKK)            > 0: signing is worth it for the community
+      cost_* components   (DKK)                            why the cost changes
+    DSO point of view:
+      exceedance          = sum_t max(P_imp - cap, 0)      congestion left (kWh)
+      congestion_removed  = 1 - exceedance / exceedance_R  share of R's congestion removed (-)
+      hours_above         = hours with P_imp > cap
+      peak, peak_reduction = max P_imp (kW), 1 - peak / peak_R (-)
+      tariff_revenue_lost = tariffs_R - tariffs (DKK)      what the discount costs the DSO
+    """
+    P, P_R = res["P_imp"], res_R["P_imp"]
+    exceedance = float(np.maximum(P - cap, 0).sum())
+    exceedance_R = float(np.maximum(P_R - cap, 0).sum())
+    return {
+        # Community
+        "cost": res["cost"],
+        "contract_value": res_R["cost"] - res["cost"],
+        "cost_energy": res["cost_energy"],
+        "cost_tariffs": res["cost_tariffs"],
+        "cost_penalty": res["cost_penalty"],
+        "cost_own": res["cost_own"],
+        # DSO
+        "exceedance": exceedance,
+        "congestion_removed": 1 - exceedance / exceedance_R,
+        "hours_above": int((P > cap + 1e-6).sum()),
+        "peak": float(P.max()),
+        "peak_reduction": float(1 - P.max() / P_R.max()),
+        "tariff_revenue_lost": res_R["cost_tariffs"] - res["cost_tariffs"],
+    }
 if __name__ == "__main__":
     com = load_community("base", day="d1")
     cap = com.contract.capacity_limit_kW
 
     results = {f.__name__: f(com).solve() for f in (CommunityModel.R, CommunityModel.I, CommunityModel.C)}
+    metrics = {name: compute_metrics(res, results["R"], cap) for name, res in results.items()}
 
-    for name, res in results.items():
-        P_imp = res["P_imp"]
-        print(f"--- Model {name} ---")
-        print("  Daily import (kWh):", round(P_imp.sum(), 2))
-        print("  Peak import (kW):", round(P_imp.max(), 2))
-        print("  Total cost (DKK):", round(res["cost"], 2))
-        print("  Exceedance of community cap (kWh):", round(np.maximum(P_imp - cap, 0).sum(), 2))
-        print("  Hours above community cap:", int((P_imp > cap + 1e-6).sum()))
-
+    # Table: one row per metric, one column per model
+    print(f"{'Metric':<22}" + "".join(f"{name:>10}" for name in metrics))
+    for key in metrics["R"]:
+        print(f"{key:<22}" + "".join(f"{metrics[name][key]:>10.2f}" for name in metrics))
+    print("Value of pooling (cost I - cost C, DKK):", round(results["I"]["cost"] - results["C"]["cost"], 2))
     print("Internal price C (DKK/kWh):", np.round(results["C"]["price"], 2))
 
-    # Validation: the direct-control model with member meters, no cap and no discount (= configuration R)
-    # must reproduce the reference values of the contract file
+    # Validation: model R against the reference values of the contract file
     print("--- Validation ---")
     print("  Model R:", {"daily_import_kWh": round(results["R"]["P_imp"].sum(), 2),
                          "peak_import_kW": round(results["R"]["P_imp"].max(), 2),
                          "cost_DKK": round(results["R"]["cost"], 2)})
     print("  File   :", com.contract.reference_model_R)
-    
+
+    # Check: the four components must add up to the total cost
+    print("--- Cost breakdown check ---")
+    for name, res in results.items():
+        parts = res["cost_energy"] + res["cost_tariffs"] + res["cost_penalty"] + res["cost_own"]
+        print(f"  {name}: total {res['cost']:.2f} | sum of parts {parts:.2f}")
