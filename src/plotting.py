@@ -83,3 +83,48 @@ def plot_import_vs_cap(results, com, path):
     fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
     fig.savefig(f"{path}.pdf", bbox_inches="tight")
     plt.close(fig)
+
+def plot_sensitivity(df_beta, df_cap, base_beta, base_f, path):
+    """Value of the contract (top) and congestion removed (bottom) against the discount (left) and the cap (right).
+
+    df_beta, df_cap : outputs of sensitivity.run_sweep for the discount ("beta") and the cap factor ("f")
+    base_beta, base_f : base-case values, marked with a vertical line
+    path : file name without extension; saves path.png and path.pdf
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(9.0, 6.2), sharex="col", sharey="row",
+                             gridspec_kw={"hspace": 0.12, "wspace": 0.08})
+    labels = {"I": r"$\mathcal{M}^I$ (individual)", "C": r"$\mathcal{M}^C$ (community)"}
+    panels = [(df_beta, "beta", base_beta, r"Tariff discount $\beta$ [-]"),
+              (df_cap, "f", base_f, r"Cap energy factor $f$ [-]  (cap $= f\,E^R/24$)")]
+
+    for col, (df, x, base, xlabel) in enumerate(panels):
+        ax_v, ax_d = axes[0, col], axes[1, col]
+        for m in ("I", "C"):
+            d = df[df["model"] == m].sort_values(x)
+            ax_v.plot(d[x], d["contract_value"], color=COLORS[m], ls=STYLES[m], lw=2, marker="o",
+                      ms=4, label=labels[m])
+            ax_d.plot(d[x], 100 * d["congestion_removed"], color=COLORS[m], ls=STYLES[m], lw=2,
+                      marker="o", ms=4, label=labels[m])
+        ax_v.axhline(0, color=INK, lw=1)
+        for ax in (ax_v, ax_d):
+            ax.axvline(base, color=INK_2, lw=1, ls=":")
+            ax.grid(axis="y", color=GRID, lw=0.8)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_color(INK_2)
+            ax.tick_params(colors=INK_2, labelsize=9)
+        ax_v.text(base, ax_v.get_ylim()[1], " base case", color=INK_2, fontsize=8, va="top", ha="left")
+        ax_d.set_xlabel(xlabel, color=INK_2)
+
+    axes[0, 0].set_ylabel("Value of the contract\n" + r"$C^R - C^m$ [DKK]", color=INK_2)
+    axes[1, 0].set_ylabel("Congestion removed\n" + r"$1 - X^m / X^R$ [%]", color=INK_2)
+    axes[0, 0].legend(loc="upper left", frameon=False, fontsize=9)
+    axes[0, 0].text(0.0, 1.0, "  signing pays off above the black line", transform=axes[0, 0].transAxes,
+                    color=INK_2, fontsize=8, va="bottom")
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(f"{path}.pdf", bbox_inches="tight")
+    plt.close(fig)
