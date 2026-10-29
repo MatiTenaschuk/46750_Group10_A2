@@ -125,8 +125,10 @@ class CommunityModel:
         self.m.Params.OutputFlag = int(self.verbose)
 
         self.net, self.own_cost = {}, {}
+        self.member_vars = {}                    # the variables for every member needed for the KKT conditions
         for d in self.com.members:
             v, c, net, own_cost = add_member(self.m, d, d.consumer_id)
+            self.member_vars[d.consumer_id] = v
             self.net[d.consumer_id] = net
             self.own_cost[d.consumer_id] = own_cost
         # --- Meters: one per member (R, I) or one for the community (C) --------------------------
@@ -192,7 +194,10 @@ class CommunityModel:
         self.m.optimize()
         if self.m.Status != GRB.OPTIMAL:
             raise RuntimeError(f"Model {self.name}: not optimal (status {self.m.Status})")
+        return self._collect()
 
+    def _collect(self):
+        """Read the solution into the result dict (separate from solve() so that Q2's PricingModel can reuse it)."""
         T, ids = self.T, self.ids
         res = {
             "model": self.name,
@@ -217,8 +222,8 @@ class CommunityModel:
         if self.meter == "member":
             # Each member pays its own meter: total cost of each member
             res["member_cost"] = {i: self.cost_meter[i].getValue() + res["own_cost"][i] for i in ids}
-        else:
-            # Dual of the internal balance: the internal price of central dispatch
+        elif not self.m.IsMIP:
+            # Dual of the internal balance: the internal price of central dispatch (an LP only, MILP has no duals)
             res["price"] = np.array([self.balance["community", t].Pi for t in T])
         return res
 
