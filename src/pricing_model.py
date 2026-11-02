@@ -1,8 +1,8 @@
 """Question 2: the pricing problem M^DP
 
-    python -m src.pricing_model                 # base case, cap only (the first of the three experiments)
-    python -m src.pricing_model --method SOS1   # the same with SOS1 instead of big-M (to validate big-M)
-
+    python -m src.pricing_model                      # base case, cap only (the first of the three experiments)
+    python -m src.pricing_model --method SOS1        # the same with SOS1 instead of big-M (to validate big-M)
+    python -m src.pricing_model --benchmark I        # IR against the individual contracts instead of M^R
 
 --------------------------------------------
 M^DP = M^C  +  posted prices x_t  +  every member's KKT conditions.
@@ -13,6 +13,7 @@ M^DP = M^C  +  posted prices x_t  +  every member's KKT conditions.
           multipliers of every member ............  (Lagrangian), 
           stationarity conditions ................ 
           complementarity (big-M or SOS1) ........  
+          budget balance, individual rationality .
     * Validation (validate_dp) like the professor's `validate`, adapted to members.
 
 Notation: report <-> code
@@ -45,7 +46,13 @@ class PricingModel(CommunityModel):
     """
 
     def __init__(self, com, method="bigM", x_max=None, M_dual=None, time_limit=600, mip_gap=1e-4,
+                 budget_balance=False, benchmark=None, soft_ir=False, ir_penalty=100.0,
                  name="DP", verbose=False):
+        """budget_balance : True -> the manager collects exactly what it pays the DSO over the day 
+        benchmark      : {member: cost alone} -> individual rationality: no member pays more than alone 
+        soft_ir        : True -> a member may pay more than alone, by w_i >= 0, at a cost of ir_penalty per DKK in the
+                         objective. Used when the hard version is infeasible: the members with w_i > 0 are the ones
+                         that block, and w_i is how much they would have to be given."""
         # M^DP has the connection point of M^C: one meter, the community cap, the discounted tariffs
         super().__init__(com, meter="community", use_cap=True, use_discount=True, name=name, verbose=verbose)
         if method not in ("bigM", "SOS1"):
@@ -60,6 +67,8 @@ class PricingModel(CommunityModel):
         # <= x_max + 2 c^L, sigma (value of stored energy) <= x_max / eta, xi and phi by differences of sigma.
         self.M_dual = float(M_dual) if M_dual is not None else 4 * self.x_max
         self.time_limit, self.mip_gap = time_limit, mip_gap
+        self.budget_balance, self.benchmark = budget_balance, benchmark
+        self.soft_ir, self.ir_penalty = soft_ir, ir_penalty
 
     def build(self):
         super().build()          # M^C: members, connection point, cap, internal balance, objective 
@@ -75,6 +84,9 @@ class PricingModel(CommunityModel):
 
         # --- Complementarity, linearized  ------------------------------------------------------------
         self._add_complementarity()
+
+        # --- Budget balance and individual rationality, linear thanks to strong duality --------------
+        self._add_requirements()
 
         # The objective is NOT changed: it is M^C's . The prices x_t are not in it, the members'
         # payments x_t q_{i,t} are transfers in the community. x_t acts only through x_t - lambda = 0.
@@ -184,6 +196,46 @@ class PricingModel(CommunityModel):
                 m.addConstr(s == a)
                 m.addSOS(GRB.SOS_TYPE1, [s, b])
 
+    def _dual_objective(self, d):
+        """Member d's total cost written as its DUAL objective (strong duality): what is left of the
+        Lagrangian once the stationarity conditions have cancelled every variable, i.e. every
+        multiplier times a number from the data. Linear, unlike payment + own cost, which contains x_t q_{i,t}.
+            D_i = sum_t [ -theta l^ref - omega_up L^max + omega_lo L^min - zeta_up PV^max
+                          - nu_up P^ch - ups_up P^dis - xi_up E ]  + mu E^min  - sigma_0 E_0 + phi E_0
+        (the last two come from e_{i,-1} = E_0 in the first SoC equation and from the end-of-day condition)."""
+        i, T, D = d.consumer_id, self.T, self.duals[d.consumer_id]
+        expr = gp.quicksum(-D["theta"][t] * d.reference_load[t] - D["om_up"][t] * d.load_upper_kWh[t]
+                            + D["om_lo"][t] * d.load_lower_kWh[t] for t in T) + D["mu"] * d.min_daily_energy_kWh
+        if d.has_pv:
+            expr += gp.quicksum(-D["z_up"][t] * d.pv_available[t] for t in T if d.pv_available[t] > 0)
+        if d.has_battery:
+            expr += gp.quicksum(-D["nu_up"][t] * d.battery_max_charge_kW - D["ups_up"][t] * d.battery_max_discharge_kW
+                                - D["xi_up"][t] * d.battery_capacity_kWh for t in T)
+            expr += (-D["sig"][T[0]] + D["phi"]) * d.battery_initial_soc_kWh
+        return expr
+
+    def _add_requirements(self):
+        """Budget balance and individual rationality both over the whole day."""
+        m, ids = self.m, self.ids
+        self.dual_obj = {d.consumer_id: self._dual_objective(d) for d in self.com.members}
+        # what each member pays the manager, sum_t x_t q_{i,t}, without multiplying two variables:
+        self.payment_lin = {i: self.dual_obj[i] - self.own_cost[i] for i in ids}
+        self.dso_cost = self.cost_meter["community"]          # what the manager pays the DSO (from M^C)
+        if self.budget_balance:
+            m.addConstr(gp.quicksum(self.payment_lin[i] for i in ids) == self.dso_cost, name="budget_balance")
+        self.w = {}
+        if self.benchmark is not None:
+            for i in ids:
+                if self.soft_ir:
+                    self.w[i] = m.addVar(lb=0, name=f"w_{i}")   # how much more than alone member i pays
+                    m.addConstr(self.dual_obj[i] <= self.benchmark[i] + self.w[i], name=f"IR_{i}")
+                else:
+                    m.addConstr(self.dual_obj[i] <= self.benchmark[i], name=f"IR_{i}")
+            if self.soft_ir:
+                m.update()                       # so that getObjective() returns M^C's objective, set in build()
+                m.setObjective(m.getObjective() + self.ir_penalty * gp.quicksum(self.w.values()), GRB.MINIMIZE)
+
+            
     # --- solve -------------------------------------------------------------------------------------------------
     def solve(self):
         if not hasattr(self, "m"):
@@ -205,6 +257,12 @@ class PricingModel(CommunityModel):
         # what each member pays the manager (x_t q_{i,t}) and its total cost (payment + PV + disutility)
         res["payment"] = {i: float(res["x"] @ res["net"][i]) for i in ids}
         res["member_cost"] = {i: res["payment"][i] + res["own_cost"][i] for i in ids}
+        res["dual_obj"] = {i: self.dual_obj[i].getValue() for i in ids}        # Step 21: equals member_cost
+        res["collected"] = sum(res["payment"].values())                        # members -> manager
+        res["paid"] = self.dso_cost.getValue()                                 # manager -> DSO
+        res["ir_slack"] = {i: self.w[i].X for i in self.w}                     # soft IR: extra paid vs alone
+        if self.soft_ir:                                                       # the community cost without penalty
+            res["cost"] -= self.ir_penalty * sum(res["ir_slack"].values())
         return res
 
 
@@ -317,6 +375,16 @@ def validate_dp(model, res, res_C=None, tol=1e-5):
         worst_gap = max(worst_gap, abs(gap))
         if max(abs(v["load"][t].X - model.member_vars[d.consumer_id]["load"][t].X) for t in model.T) > 1e-4:
             different.append(d.consumer_id)
+    # 4b. strong duality (Step 21): every member's total cost = its dual objective, so the linear payments are right
+    sd = max(abs(res["dual_obj"][i] - res["member_cost"][i]) for i in res["member_cost"])
+    ok &= sd <= 1e-4
+    print(f"4b. strong duality: largest |dual objective - total cost| = {sd:.1e} DKK  ->  "
+          f"{'OK' if sd <= 1e-4 else 'VIOLATED'}")
+    if model.budget_balance:
+        bb = abs(res["collected"] - res["paid"])
+        ok &= bb <= 1e-4
+        print(f"4c. budget balance: collected {res['collected']:.2f}, paid {res['paid']:.2f} DKK  ->  "
+              f"{'OK' if bb <= 1e-4 else 'VIOLATED'}")
     m_ok = worst_gap <= 1e-4
     ok &= m_ok
     print(f"4. members alone at the posted prices: largest cost difference {worst_gap:.1e} DKK  ->  "
@@ -354,35 +422,142 @@ def check_C_prices(com, res_C, method="bigM"):
 
 
 # --- run --------------------------------------------------------------------------------------------------------------------
+def member_table(com, res, benchmark):
+    """Per member: slope class, assets, cost alone (benchmark), cost in M^DP, gain, and the IR slack if any."""
+    rows = []
+    for d in com.members:
+        i = d.consumer_id
+        rows.append({"member": i, "slope class": f"L{d.slope_class}",
+                     "assets": {(False, False): "-", (True, False): "PV", (False, True): "B",
+                                (True, True): "PV+B"}[(d.has_pv, d.has_battery)],
+                     "alone [DKK]": benchmark[i], "in DP [DKK]": res["member_cost"][i],
+                     "gain [DKK]": benchmark[i] - res["member_cost"][i],
+                     "extra needed w [DKK]": res["ir_slack"].get(i, 0.0)})
+    df = pd.DataFrame(rows).set_index("member")
+    num = df.select_dtypes("number").columns
+    df[num] = df[num].round(2) + 0.0          # + 0.0 turns -0.0 into 0.0
+    return df
+
+
+def set_start(model, previous):
+    """Give Gurobi the solution of a previous experiment as a starting point. The models are built
+    the same way, so their variables have the same names. If the start satisfies the new constraints (e.g. the
+    budget-balanced solution in the soft IR model, with w_i = what each member pays above its cost alone), Gurobi
+    has a solution from the first second, if not, it tries to repair it."""
+    for v in model.m.getVars():
+        old = previous.m.getVarByName(v.VarName)
+        if old is not None:
+            v.Start = old.X
+    if model.soft_ir and model.benchmark is not None:
+        for i, w in model.w.items():               # w_i = how much more than alone member i pays at the start
+            cost_i = previous.dual_obj[i].getValue()
+            w.Start = max(0.0, cost_i - model.benchmark[i])
+
+
+def solve_experiment(com, name, method, time_limit, start=None, **options):
+    """Solve one experiment. If it is infeasible, or no solution is found within the time limit, say so and return
+    (model, None). `start`: a solved PricingModel whose solution is used as a starting point."""
+    model = PricingModel(com, method=method, time_limit=time_limit, **options)
+    model.build()
+    model.m.Params.DualReductions = 0           # so that Gurobi reports INFEASIBLE, not "infeasible or unbounded"
+    if start is not None:
+        set_start(model, start)
+    try:
+        res = model.solve()
+    except RuntimeError:
+        if model.m.Status == GRB.INFEASIBLE:
+            print(f"=== {name}: INFEASIBLE: no uniform prices satisfy all these requirements ===\n")
+            return model, None
+        if model.m.Status == GRB.TIME_LIMIT:     # status 9 with no solution at all
+            print(f"=== {name}: NO SOLUTION FOUND within {time_limit:g} s (not proven infeasible) ===\n")
+            return model, None
+        raise
+    return model, res
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", default="bigM", choices=["bigM", "SOS1"])
     ap.add_argument("--day", default="d1")
     ap.add_argument("--time-limit", type=float, default=600)
+    ap.add_argument("--benchmark", default="R", choices=["R", "I"], help="IR against M^R (default) or M^I")
+    ap.add_argument("--skip-indifference", action="store_true", help="skip the indifference analysis (faster)")
     args = ap.parse_args()
 
     com = load_community("base", day=args.day)
+    cap = com.contract.capacity_limit_kW
+    out = Path("results/q2")
+    out.mkdir(parents=True, exist_ok=True)
     res_C = CommunityModel.C(com).solve()
-    model = PricingModel(com, method=args.method, time_limit=args.time_limit)
-    res = model.solve()
+    res_B = getattr(CommunityModel, args.benchmark)(com).solve()      # each member's cost alone: the IR benchmark
+    benchmark = res_B["member_cost"]
 
-    print(f"=== M^DP, cap only ({args.method}), day {args.day} ===")
+# ---------------------------------------------------------------- experiment 1: cap only
+    model, res = solve_experiment(com, "cap only", args.method, args.time_limit)
+    print(f"=== Experiment 1: cap only ({args.method}), day {args.day} ===")
     print(f"community cost: DP {res['cost']:.2f} DKK, C {res_C['cost']:.2f} DKK")
     print("hour  p_t   x_t(DP)  x_t(C)   import DP  import C   cap")
-    cap = com.contract.capacity_limit_kW
     for t in model.T:
         print(f"{t:>4} {com.energy_price[t]:5.2f} {res['x'][t]:8.3f} {res_C['price'][t]:8.3f} "
               f"{res['P_imp'][t]:10.2f} {res_C['P_imp'][t]:9.2f} {cap[t]:6.2f}")
     validate_dp(model, res, res_C)
     check_C_prices(com, res_C, method=args.method)
-    out = Path("results/q2")
-    out.mkdir(parents=True, exist_ok=True)
-    print()
-    ind = indifferent_member_hours(com, res["x"])
-    summarize_indifference(model, res, ind, path=out / f"indifferent_{args.method}_{args.day}.csv")
-    print(f"full list saved in results/q2/indifferent_{args.method}_{args.day}.csv")
     pd.DataFrame({"hour": list(model.T), "p": com.energy_price, "x_DP": res["x"], "x_C": res_C["price"],
-                  "P_imp_DP": res["P_imp"], "P_imp_C": res_C["P_imp"], "cap": cap}
-                 ).to_csv(out / f"cap_only_{args.method}_{args.day}.csv", index=False)
-    print(f"saved results/q2/cap_only_{args.method}_{args.day}.csv")
+                      "P_imp_DP": res["P_imp"], "P_imp_C": res_C["P_imp"], "cap": cap}
+                     ).to_csv(out / f"cap_only_{args.method}_{args.day}.csv", index=False)
+    if not args.skip_indifference:
+        print()
+        ind = indifferent_member_hours(com, res["x"])
+        summarize_indifference(model, res, ind, path=out / f"indifferent_{args.method}_{args.day}.csv")
+    print(f"manager: collects {res['collected']:.2f}, pays the DSO {res['paid']:.2f}, "
+          f"keeps {res['collected'] - res['paid']:.2f} DKK")
+    print(member_table(com, res, benchmark).to_string(), "\n")
+    summary = {"1. cap only": res}
+
+    # ---------------------------------------------------------------- experiments 2 and 3
+    experiments = {
+        "2. + budget balance": dict(budget_balance=True),
+        "3. + budget balance + IR": dict(budget_balance=True, benchmark=benchmark),
+    }
+    previous = model                             # the last solved model (here: cap only), the next one's start
+    for name, options in experiments.items():
+        model, res = solve_experiment(com, name, args.method, args.time_limit, start=previous, **options)
+        if res is None and "IR" in name:
+            # hard IR infeasible (or no solution found): which members block, and how much would they need?
+            # Soft IR, started from the budget-balanced solution, which is feasible for it.
+            print(f"=== {name}, soft version: who blocks? ===")
+            model, res = solve_experiment(com, name + " (soft)", args.method, args.time_limit, start=previous,
+                                          soft_ir=True, **options)
+            name = name + " (soft)"
+        if res is not None:
+            previous = model
+        if res is None:
+             continue
+        print(f"=== Experiment {name} ===")
+        print(f"community cost: DP {res['cost']:.2f} DKK, C {res_C['cost']:.2f} DKK "
+              f"(efficiency loss {res['cost'] - res_C['cost']:.2f} DKK)")
+        print("posted prices x_t:", np.round(res["x"], 3))
+        print(f"manager: collects {res['collected']:.2f}, pays the DSO {res['paid']:.2f}, "
+              f"keeps {res['collected'] - res['paid']:.2f} DKK")
+        above = res["above"]
+        print(f"import above the cap: {above.sum():.2f} kWh in hours {[int(t) for t in np.where(above > 1e-6)[0]]}, "
+              f"penalty {com.contract.penalty_DKK_per_kWh * above.sum():.2f} DKK")
+        validate_dp(model, res, res_C)
+        table = member_table(com, res, benchmark)
+        print(table.to_string())
+        blockers = table[table["extra needed w [DKK]"] > 1e-4]
+        if not blockers.empty:
+            print(f"BLOCKING members (pay more than alone even at the best prices): {list(blockers.index)}, "
+                  f"in total {blockers['extra needed w [DKK]'].sum():.2f} DKK would have to be given to them")
+        table.to_csv(out / f"members_{name.split('.')[0]}_{args.method}_{args.day}.csv")
+        print()
+        summary[name] = res
+ 
+    # ---------------------------------------------------------------- the three experiments side by side
+    print(f"=== Summary (IR benchmark: M^{args.benchmark}) ===")
+    print(f"{'experiment':<34}{'cost':>9}{'loss vs C':>11}{'manager keeps':>15}{'members worse off':>19}")
+    for name, res in summary.items():
+        worse = sum(res["member_cost"][i] > benchmark[i] + 1e-4 for i in benchmark)
+        print(f"{name:<34}{res['cost']:>9.2f}{res['cost'] - res_C['cost']:>11.2f}"
+               f"{res['collected'] - res['paid']:>15.2f}{worse:>19}")   
  
