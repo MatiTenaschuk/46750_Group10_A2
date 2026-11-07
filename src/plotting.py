@@ -128,3 +128,78 @@ def plot_sensitivity(df_beta, df_cap, base_beta, base_f, path):
     fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
     fig.savefig(f"{path}.pdf", bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_sensitivity_summary(df_grid, df_beta, base_beta, base_f, cap_base_kW, path):
+    """Sensitivity to the contract terms in two panels.
+
+    (a) Value of the community contract over discount x cap, with the break-even lines of C and I.
+    (b) Along the discount (base cap): what the community gains and what the DSO gives up in tariffs.
+
+    df_grid : output of sensitivity.run_grid;  df_beta : output of sensitivity.run_sweep for "beta"
+    base_beta, base_f : base case;  cap_base_kW : cap of the base case [kW] (cap = cap_base_kW * f / base_f)
+    path : file name without extension; saves path.png and path.pdf
+    """
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.3), gridspec_kw={"width_ratios": [1.15, 1], "wspace": 0.32})
+
+    # --- (a) Map: value of the community contract over discount x cap
+    grid = {m: df_grid[df_grid["model"] == m].pivot(index="f", columns="beta", values="contract_value")
+            for m in ("I", "C")}
+    x = 100 * grid["C"].columns.to_numpy()                          # discount [%]
+    y = cap_base_kW * grid["C"].index.to_numpy() / base_f            # cap [kW]
+    zC, zI = grid["C"].to_numpy(), grid["I"].to_numpy()
+    cmap = LinearSegmentedColormap.from_list("value", ["#9a3a12", "#eb6834", "#f0efec", "#1baf7a", "#0b6b47"])
+    lim = np.abs(zC).max()
+    dx, dy = x[1] - x[0], y[1] - y[0]
+    mesh = ax1.pcolormesh(np.append(x - dx / 2, x[-1] + dx / 2), np.append(y - dy / 2, y[-1] + dy / 2), zC,
+                          cmap=cmap, norm=TwoSlopeNorm(vmin=-lim, vcenter=0.0, vmax=lim))
+    cbar = fig.colorbar(mesh, ax=ax1, pad=0.02)
+    cbar.set_label("Value of the community contract [DKK]", color=INK_2, fontsize=9)
+    cbar.outline.set_visible(False)
+    cbar.ax.tick_params(colors=INK_2, labelsize=8)
+    ax1.contour(x, y, zC, levels=[0], colors=INK, linewidths=2)
+    if zI.min() < 0 < zI.max():
+        ax1.contour(x, y, zI, levels=[0], colors=INK, linewidths=1.5, linestyles="dashed")
+    ax1.plot(100 * base_beta, cap_base_kW, marker="o", ms=7, color=INK, ls="none")
+    ax1.text(100 * base_beta + 2.5, cap_base_kW, "base case", fontsize=8.5, va="center", color=INK,
+             bbox=dict(boxstyle="round,pad=0.2", fc="#fcfcfb", ec="none", alpha=0.85))
+    box = dict(boxstyle="round,pad=0.2", fc="#fcfcfb", ec="none", alpha=0.85)
+    ax1.text(12, 7.9, "not worth\nsigning", fontsize=8.5, ha="center", va="center", color=INK, bbox=box)
+    ax1.text(52, 12.2, "worth signing together", fontsize=8.5, ha="center", va="center", color=INK, bbox=box)
+    ax1.text(90, 14.1, "alone too", fontsize=8, ha="center", va="center", color=INK, bbox=box)
+    ax1.set_xlabel("Discount on the grid tariffs [%]", color=INK_2)
+    ax1.set_ylabel("Cap [kW]", color=INK_2)
+    ax1.set_title("(a) The tighter the cap, the larger the discount needed", fontsize=10, loc="left", color=INK)
+
+    # --- (b) Along the discount, at the base cap: community gain against DSO cost (both in DKK)
+    d = {m: df_beta[df_beta["model"] == m].sort_values("beta") for m in ("I", "C")}
+    ax2.axhline(0, color=INK, lw=1)
+    ax2.plot(100 * d["C"]["beta"], d["C"]["contract_value"], color=COLORS["C"], lw=2,
+             label=r"community gain, $\mathcal{M}^C$")
+    ax2.plot(100 * d["I"]["beta"], d["I"]["contract_value"], color=COLORS["I"], lw=2, ls="--",
+             label=r"community gain, $\mathcal{M}^I$")
+    ax2.plot(100 * d["C"]["beta"], d["C"]["tariff_revenue_lost"], color=INK_2, lw=2, ls=":",
+             label=r"DSO tariff revenue lost, $\mathcal{M}^C$")
+    ax2.axvline(100 * base_beta, color=INK_2, lw=1, ls=(0, (1, 3)))
+    ax2.text(100 * base_beta - 1, 0.04, "base case", transform=ax2.get_xaxis_transform(), color=INK_2, fontsize=8, ha="right")
+    ax2.set_xlabel("Discount on the grid tariffs [%]", color=INK_2)
+    ax2.set_ylabel("DKK per day", color=INK_2)
+    ax2.set_title(f"(b) At {cap_base_kW:.1f} kW, the discount moves money, not load",
+                  fontsize=10, loc="left", color=INK)
+    ax2.legend(loc="upper left", frameon=False, fontsize=8.5)
+
+    for ax in (ax1, ax2):
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(INK_2)
+        ax.tick_params(colors=INK_2, labelsize=9)
+    ax2.grid(axis="y", color=GRID, lw=0.8)
+    ax2.set_axisbelow(True)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(f"{path}.pdf", bbox_inches="tight")
+    plt.close(fig)

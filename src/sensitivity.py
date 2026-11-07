@@ -67,10 +67,27 @@ def break_even(df, name, model):
     return None
 
 
+def run_grid(com, betas, factors):
+    """Value of the contract of I and C on a grid of discount (beta) x cap factor (f).
+
+    The cost without contract (R) does not depend on the contract terms, so R is solved once.
+    Returns a DataFrame with columns beta, f, model ("I" or "C") and contract_value = C^R - C^m (DKK).
+    """
+    cost_R = CommunityModel.R(com).solve()["cost"]
+    rows = []
+    for f in factors:
+        for beta in betas:
+            com_v = with_discount(with_cap_factor(com, f), beta)
+            for m in ("I", "C"):
+                cost_m = getattr(CommunityModel, m)(com_v).solve()["cost"]
+                rows.append({"beta": beta, "f": f, "model": m, "contract_value": cost_R - cost_m})
+        print(f"  f = {f:.2f} done")
+    return pd.DataFrame(rows)
+
 if __name__ == "__main__":
     from pathlib import Path
-    from src.plotting import plot_sensitivity
-
+    from src.plotting import plot_sensitivity, plot_sensitivity_summary
+    
     out = Path("results/q1")
     out.mkdir(parents=True, exist_ok=True)
     com = load_community("base", day="d1")
@@ -88,4 +105,10 @@ if __name__ == "__main__":
             print(f"Break-even {name} for model {m}: {break_even(df, name, m)}")
 
     plot_sensitivity(df_beta, df_cap, base_beta=0.75, base_f=1.3, path=str(out / "sensitivity"))
-    print("Tables and figure saved in results/q1/")
+
+    print("Grid of discount x cap factor (value of the contract):")
+    df_grid = run_grid(com, np.round(np.arange(0.0, 1.01, 0.1), 2), np.round(np.arange(1.0, 2.01, 0.1), 2))
+    df_grid.to_csv(out / "grid_beta_cap.csv", index=False)
+    plot_sensitivity_summary(df_grid, df_beta, base_beta=0.75, base_f=1.3,
+                             cap_base_kW=com.contract.capacity_limit_kW[0], path=str(out / "sensitivity_summary"))
+    print("Tables and figures saved in results/q1/")
