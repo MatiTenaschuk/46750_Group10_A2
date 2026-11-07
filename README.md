@@ -309,3 +309,46 @@ As in Assignment 1: keep data loading, model building, solving and plotting sepa
 and save its outputs under `results/`; fix and report the seeds of every scenario set; and commit regularly with
 meaningful messages - the git history is also a record of everyone's contribution. The graders should be able to open
 the code, follow this README, and reproduce every number and figure of the report.
+
+## 6. Group 10: reproducing the results of the report
+
+All commands are run from the repository root, in the environment of Section 1 (Gurobi licence required).
+Every script writes its tables (`.csv`) and figures (`.png` for viewing, `.pdf` for the report) to `results/`.
+
+### 6.1 Question 1: is the community worth forming?
+
+**Code.**
+```
+src/community_model.py   add_member(): one member (load, PV, battery), its net consumption and own cost
+                         CommunityModel: models R, I and C as one parametrized class with switches
+                           meter="member" | "community", use_cap, use_discount
+                           named configurations CommunityModel.R(com), .I(com), .C(com)
+                           .solve() -> dict with the import/export at the meter(s), the net consumption and
+                           own cost of every member, the cost breakdown and, for C, the internal price
+                         compute_metrics(): community and DSO metrics of a model against R
+src/sensitivity.py       with_discount(), with_cap_factor(): variations of the contract terms (copies, data untouched)
+                         run_sweep(), run_grid(), break_even(): sweeps of the discount and the cap
+src/settlement.py        settle(), budget_balance(): settlement of C at the internal price, budget balance
+                         and individual rationality against R and I
+src/plotting.py          the figures of Question 1
+```
+
+**One command per experiment.**
+
+| Command | What it reproduces | Outputs in `results/q1/` |
+|---|---|---|
+| `python -m src.community_model` | Base case: models R, I and C, validation of R against the contract file, metrics (Table "value of the contract"), import against the cap and internal price | `import_vs_cap.png/.pdf` |
+| `python -m src.sensitivity` | Sensitivity to the discount and the cap: sweeps, break-even values, grid of 11 x 11 contract terms (about one minute) | `sweep_beta.csv`, `sweep_cap.csv`, `grid_beta_cap.csv`, `sensitivity_summary.png/.pdf` (report), `sensitivity.png/.pdf` (appendix) |
+| `python -m src.settlement` | Settlement of C at the internal price: cost of every member under R, I and C, budget balance of the manager, individual rationality | `settlement.csv`, `settlement.png/.pdf` |
+
+**Base-case values to check** (day d1): cost 398.24 DKK (R), 480.13 DKK (I), 372.16 DKK (C); peak import
+27.6 kW (R), 9.39 kW (C); manager surplus under the internal-price settlement 163.77 DKK.
+
+**Modelling choices** (motivated in the report).
+- The battery ends the day with at least its initial state of charge, as in Assignment 1.
+- A kWh above the cap pays the penalty instead of the discounted tariff (assignment text).
+- The contract variations keep the penalty at 10 DKK/kWh and scale the individual caps of model I with the
+  community's cap, so that they still add up to it.
+- Models R and I are solved as one model with all members and no coupling, which gives the same optimum as
+  solving every member alone; the limit case of C without cap and discount, with tariffs on the members'
+  own flows, reproduces R.
