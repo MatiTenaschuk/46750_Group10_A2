@@ -203,3 +203,46 @@ def plot_sensitivity_summary(df_grid, df_beta, base_beta, base_f, cap_base_kW, p
     fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
     fig.savefig(f"{path}.pdf", bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_settlement(df, path):
+    """Gain of every member under the community contract, settled at the internal price.
+
+    Bars: gain against no contract (R); dots: gain against its own contract (I). Members grouped by
+    disutility slope, from the most flexible to the most rigid.
+    df   : output of settlement.settle
+    path : file name without extension; saves path.png and path.pdf
+    """
+    order = ["none", "PV", "battery", "PV + battery"]
+    d = df.assign(_a=df["assets"].map({a: k for k, a in enumerate(order)})).sort_values(["slope", "_a"])
+    y = np.arange(len(d))[::-1]
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.0))
+    colors = np.where(d["gain_vs_R"] >= 0, COLORS["C"], COLORS["I"])
+    ax.barh(y, d["gain_vs_R"], color=colors, height=0.7, label="gain against no contract ($\\mathcal{M}^R$)")
+    ax.plot(d["gain_vs_I"], y, "o", ms=6, color=INK, label="gain against its own contract ($\\mathcal{M}^I$)")
+    ax.axvline(0, color=INK, lw=1)
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{m}  ({a})" for m, a in zip(d["member"], d["assets"])], fontsize=8.5)
+    for k in range(1, 4):                                # separate the four slope classes
+        ax.axhline(y[4 * k] + 0.5, color=GRID, lw=1)
+    for k, s in enumerate(sorted(d["slope"].unique())):
+        ax.text(1.0, y[4 * k] - 1.5, f"  slope {s:g} DKK/kWh", transform=ax.get_yaxis_transform(),
+                color=INK_2, fontsize=8, va="center")
+    ax.set_xlabel("Gain under the community contract [DKK per day]  (> 0: better off)", color=INK_2)
+    n_lose = int((d["gain_vs_R"] < -1e-6).sum())
+    ax.set_title(f"Settled at the internal price, {n_lose} of {len(d)} members lose against no contract",
+                 fontsize=10, loc="left", color=INK)
+    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.04), ncol=2, frameon=False, fontsize=8.5)
+    ax.grid(axis="x", color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(INK_2)
+    ax.tick_params(colors=INK_2, labelsize=9)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(f"{path}.pdf", bbox_inches="tight")
+    plt.close(fig)
