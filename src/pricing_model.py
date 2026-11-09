@@ -40,19 +40,21 @@ class PricingModel(CommunityModel):
 
     method   : 'bigM' -> every pair 0 <= a, b >= 0 becomes  a <= M_P u,  b <= M_D (1 - u),  u binary
                'SOS1' -> {a, b} is a special ordered set of type 1 (no M to choose)
-    x_max    : price bound 0 <= x_t <= x_max (paper, eq. 2f). Default: max_t p_t + (1-beta) tau^imp + alpha, the
+    x_max    : price bound 0 <= x_t <= x_max. Default: max_t p_t + (1-beta) tau^imp + alpha, the
                highest internal price M^C can ever have (cap multiplier gamma_t <= alpha), so M^C's prices are allowed.
     M_dual   : M_D, one constant for all multipliers (DKK/kWh). M_P is computed per pair from the data.
     """
 
     def __init__(self, com, method="bigM", x_max=None, M_dual=None, time_limit=600, mip_gap=1e-4,
                  budget_balance=False, benchmark=None, soft_ir=False, ir_penalty=100.0,
-                 name="DP", verbose=False):
+                 discriminate=False, name="DP", verbose=False):
         """budget_balance : True -> the manager collects exactly what it pays the DSO over the day 
         benchmark      : {member: cost alone} -> individual rationality: no member pays more than alone 
         soft_ir        : True -> a member may pay more than alone, by w_i >= 0, at a cost of ir_penalty per DKK in the
-                         objective. Used when the hard version is infeasible: the members with w_i > 0 are the ones
-                         that block, and w_i is how much they would have to be given."""
+                          objective. Used when the hard version is infeasible: the members with w_i > 0 are the ones
+                          that block, and w_i is how much they would have to be given.
+        discriminate   : True -> one price x_{i,t} per member and hour instead of one x_t for everybody (per-consumer
+                         price discrimination). Everything else is unchanged."""
         # M^DP has the connection point of M^C: one meter, the community cap, the discounted tariffs
         super().__init__(com, meter="community", use_cap=True, use_discount=True, name=name, verbose=verbose)
         if method not in ("bigM", "SOS1"):
@@ -69,13 +71,17 @@ class PricingModel(CommunityModel):
         self.time_limit, self.mip_gap = time_limit, mip_gap
         self.budget_balance, self.benchmark = budget_balance, benchmark
         self.soft_ir, self.ir_penalty = soft_ir, ir_penalty
+        self.discriminate = discriminate
 
     def build(self):
         super().build()          # M^C: members, connection point, cap, internal balance, objective 
         m, T = self.m, self.T
 
-        # --- Upper level: the posted prices, the same for every member  -----------------------------
-        self.x = m.addVars(T, lb=0, ub=self.x_max, name="x")
+        # --- Upper level: the posted prices (report 2.1.4): the same for every member, or one per member -----------
+        if self.discriminate:
+            self.x = m.addVars(self.ids, T, lb=0, ub=self.x_max, name="x")     # x_{i,t}
+        else:
+            self.x = m.addVars(T, lb=0, ub=self.x_max, name="x")               # x_t
 
         # --- Lower level: every member's KKT conditions  ---------------------------------------------
         self.duals, self.pairs = {}, []
@@ -92,6 +98,9 @@ class PricingModel(CommunityModel):
         # payments x_t q_{i,t} are transfers in the community. x_t acts only through x_t - lambda = 0.
         m.update()
         return self
+    def price(self, i, t):
+        """The price member i sees in hour t: x_t (uniform) or x_{i,t} (discrimination)."""
+        return self.x[i, t] if self.discriminate else self.x[t]
 
     def _add_member_kkt(self, d):
         """Multipliers, stationarity and the list of complementarity pairs of one member."""
@@ -125,7 +134,7 @@ class PricingModel(CommunityModel):
         # ---- stationarity: one condition per variable, add up the numbers in front of it  -------------
         cL = d.linear_disutility
         for t in T:
-            m.addConstr(self.x[t] - D["lam"][t] == 0, name=f"{i}_stat_q[{t}]")              # THE change from A1
+            m.addConstr(self.price(i, t) - D["lam"][t] == 0, name=f"{i}_stat_q[{t}]")       # THE change from A1
             m.addConstr(cL - D["theta"][t] - D["psi_p"][t] == 0, name=f"{i}_stat_dplus[{t}]")
             m.addConstr(cL + D["theta"][t] - D["psi_m"][t] == 0, name=f"{i}_stat_dminus[{t}]")
             m.addConstr(D["lam"][t] + D["theta"][t] - D["mu"] + D["om_up"][t] - D["om_lo"][t] == 0,
@@ -183,7 +192,7 @@ class PricingModel(CommunityModel):
                       M(d.battery_capacity_kWh - d.battery_initial_soc_kWh)))
 
     def _add_complementarity(self):
-        """Big-M (Fortuny-Amat) or SOS1 for every pair, as in the professor's PriceMakerMPEC."""
+        """Big-M (Fortuny-Amat) or SOS1 for every pair, as in the PriceMakerMPEC."""
         m = self.m
         self.u = {}
         for name, a, b, M_P in self.pairs:
@@ -252,12 +261,14 @@ class PricingModel(CommunityModel):
         res["mip_gap"] = self.m.MIPGap
         res["solve_time"] = self.m.Runtime
         res["n_binaries"] = self.m.NumBinVars
-        res["x"] = np.array([self.x[t].X for t in T])                                   # posted prices
+        # the price every member sees; with discrimination, res["x"] is the average over the members (for printing)
+        res["x_member"] = {i: np.array([self.price(i, t).X for t in T]) for i in ids}
+        res["x"] = np.mean([res["x_member"][i] for i in ids], axis=0)
         res["mu"] = {i: self.duals[i]["mu"].X for i in ids}
         # what each member pays the manager (x_t q_{i,t}) and its total cost (payment + PV + disutility)
-        res["payment"] = {i: float(res["x"] @ res["net"][i]) for i in ids}
+        res["payment"] = {i: float(res["x_member"][i] @ res["net"][i]) for i in ids}
         res["member_cost"] = {i: res["payment"][i] + res["own_cost"][i] for i in ids}
-        res["dual_obj"] = {i: self.dual_obj[i].getValue() for i in ids}        # Step 21: equals member_cost
+        res["dual_obj"] = {i: self.dual_obj[i].getValue() for i in ids}        # equals member_cost
         res["collected"] = sum(res["payment"].values())                        # members -> manager
         res["paid"] = self.dso_cost.getValue()                                 # manager -> DSO
         res["ir_slack"] = {i: self.w[i].X for i in self.w}                     # soft IR: extra paid vs alone
@@ -351,51 +362,89 @@ def _val(e):
 
 
 def validate_dp(model, res, res_C=None, tol=1e-5):
-    """Like the homeworks solution, adapted to M^DP. Prints a verdict."""
+    """The five checks from week's 7 homework, in her order, then three checks specific to
+    M^DP. Every check is always printed (with "not applicable" when it does not apply), so the numbering never jumps.
+        1. status                          5. each member re-solved alone     
+        2. KKT residuals                   6. strong duality                   
+        3. complementarity                 7. budget balance                   
+        4. big-M not binding               8. against M^C                      """
     ok = True
+    # 1. status ------------------------------------------------------------------------------------------------
     print(f"1. status: {res['status']}, MIP gap {res['mip_gap']:.1e}, {res['n_binaries']} binaries, "
           f"{res['solve_time']:.1f} s")
-    # 2. complementarity: a * b = 0 for every pair (relative to the size of a and b)
+ 
+    # 2. KKT residuals: primal feasibility, stationarity, dual feasibility (signs) ------------------------------
+    def violation(c):
+        """How much constraint c is violated at the solution (0 if satisfied). Gurobi's Slack = rhs - lhs."""
+        if c.Sense == "=":
+            return abs(c.Slack)
+        return max(0.0, -c.Slack) if c.Sense == "<" else max(0.0, c.Slack)
+    stat = [violation(c) for c in model.m.getConstrs() if "_stat_" in c.ConstrName]
+    prim = [violation(c) for c in model.m.getConstrs() if "_stat_" not in c.ConstrName]
+    prim.append(max(max(0.0, v.LB - v.X, v.X - v.UB) for v in model.m.getVars()))          # variable bounds
+    signs = [var.X for D in model.duals.values() for key, mult in D.items()
+             if key not in ("lam", "theta", "sig")                                         # free multipliers
+             for var in (mult.values() if hasattr(mult, "values") else [mult])]
+    r_prim, r_stat, r_sign = max(prim), max(stat), max(0.0, -min(signs))
+    k_ok = max(r_prim, r_stat, r_sign) <= tol
+    ok &= k_ok
+    print(f"2. KKT residuals: primal feasibility {r_prim:.1e}, stationarity {r_stat:.1e}, "
+          f"dual feasibility (signs) {r_sign:.1e}  ->  {'OK' if k_ok else 'VIOLATED'}")
+ 
+    # 3. complementarity: a * b = 0 for every pair --------------------------------------------------------------
     worst = max(abs(_val(a) * _val(b)) for _, a, b, _ in model.pairs)
     ok &= worst <= tol
-    print(f"2. complementarity: max |a*b| = {worst:.1e}  ->  {'OK' if worst <= tol else 'VIOLATED'}")
-    # 3. big-M: no disjunctive constraint may be binding (otherwise M, not the problem, decided the solution)
+    print(f"3. complementarity: max |a*b| = {worst:.1e}  ->  {'OK' if worst <= tol else 'VIOLATED'}")
+ 
+    # 4. big-M: no disjunctive constraint may be binding (otherwise M, not the problem, decided the solution) ----
     if model.method == "bigM":
         ra = max(_val(a) / M_P for _, a, _, M_P in model.pairs)
         rb = max(_val(b) / model.M_dual for _, _, b, _ in model.pairs)
         m_ok = ra < 1 - 1e-6 and rb < 1 - 1e-6
         ok &= m_ok
-        print(f"3. big-M: largest a/M_P = {ra:.3f}, largest b/M_D = {rb:.3f}  ->  {'OK' if m_ok else 'M TOO SMALL'}")
-    # 4. every member re-solved alone at the posted prices: its schedule in M^DP must cost what its optimum costs
+        print(f"4. big-M: largest a/M_P = {ra:.3f}, largest b/M_D = {rb:.3f}  ->  {'OK' if m_ok else 'M TOO SMALL'}")
+    else:
+        print("4. big-M: not applicable (SOS1 has no M)")
+ 
+    # 5. every member re-solved alone at the posted prices: its schedule must cost what its optimum costs --------
     worst_gap, different = 0.0, []
     for d in model.com.members:
-        m, v, cost = member_alone(d, res["x"])
+        m, v, cost = member_alone(d, res["x_member"][d.consumer_id])
         m.optimize()
-        gap = res["member_cost"][d.consumer_id] - m.ObjVal
-        worst_gap = max(worst_gap, abs(gap))
+        worst_gap = max(worst_gap, abs(res["member_cost"][d.consumer_id] - m.ObjVal))
         if max(abs(v["load"][t].X - model.member_vars[d.consumer_id]["load"][t].X) for t in model.T) > 1e-4:
             different.append(d.consumer_id)
-    # 4b. strong duality (Step 21): every member's total cost = its dual objective, so the linear payments are right
+    m_ok = worst_gap <= 1e-4
+    ok &= m_ok
+    print(f"5. members alone at the posted prices: largest cost difference {worst_gap:.1e} DKK  ->  "
+          f"{'OK' if m_ok else 'A MEMBER IS NOT OPTIMAL'}"
+          + (f"; {len(different)} members have another optimal schedule (indifferent)" if different else ""))
+ 
+    # 6. strong duality : every member's total cost = its dual objective ----------------------------------------
     sd = max(abs(res["dual_obj"][i] - res["member_cost"][i]) for i in res["member_cost"])
     ok &= sd <= 1e-4
-    print(f"4b. strong duality: largest |dual objective - total cost| = {sd:.1e} DKK  ->  "
+    print(f"6. strong duality: largest |dual objective - total cost| = {sd:.1e} DKK  ->  "
           f"{'OK' if sd <= 1e-4 else 'VIOLATED'}")
+ 
+    # 7. budget balance -----------------------------------------------------------------------------------------
     if model.budget_balance:
         bb = abs(res["collected"] - res["paid"])
         ok &= bb <= 1e-4
-        print(f"4c. budget balance: collected {res['collected']:.2f}, paid {res['paid']:.2f} DKK  ->  "
+        print(f"7. budget balance: collected {res['collected']:.2f}, paid {res['paid']:.2f} DKK  ->  "
               f"{'OK' if bb <= 1e-4 else 'VIOLATED'}")
-    m_ok = worst_gap <= 1e-4
-    ok &= m_ok
-    print(f"4. members alone at the posted prices: largest cost difference {worst_gap:.1e} DKK  ->  "
-          f"{'OK' if m_ok else 'A MEMBER IS NOT OPTIMAL'}"
-          + (f"; another optimal schedule exists for {different} (indifferent)" if different else ""))
-    # 5. against M^C: same cost? same price shape (prices may differ by a constant level, see our tiny example)?
-    if res_C is not None:
+    else:
+        print(f"7. budget balance: not imposed (collected {res['collected']:.2f}, paid {res['paid']:.2f} DKK)")
+ 
+    # 8. against M^C : same cost? how do the prices compare? ----------------------------------------------------
+    if res_C is not None and model.discriminate:
+        print(f"8. against M^C: cost DP - C = {res['cost'] - res_C['cost']:.4f} DKK (per-member prices: "
+              f"no single price profile to compare)")
+    elif res_C is not None:
         dc = res["cost"] - res_C["cost"]
         shape = (res["x"] - res["x"].mean()) - (res_C["price"] - res_C["price"].mean())
-        print(f"5. against M^C: cost DP - C = {dc:.4f} DKK; largest difference in price shape "
+        print(f"8. against M^C: cost DP - C = {dc:.4f} DKK; largest difference in price shape "
               f"{np.abs(shape).max():.3f} DKK/kWh; mean price DP {res['x'].mean():.3f} vs C {res_C['price'].mean():.3f}")
+ 
     if not ok:
         print("VERDICT: solution NOT validated")
     elif res["status"] != "OPTIMAL":
@@ -414,7 +463,7 @@ def check_C_prices(com, res_C, method="bigM"):
         model.x[t].LB = model.x[t].UB = float(res_C["price"][t])
     res = model.solve()
     same = abs(res['cost'] - res_C['cost']) <= 1e-4
-    print(f"6. Post model C's internal prices (Q1) as x_t and let every member react on its own:\n"
+    print(f"9. Post model C's internal prices (Q1) as x_t and let every member react on its own:\n"
           f"   community cost {res['cost']:.2f} DKK, under central dispatch {res_C['cost']:.2f} DKK  ->  "
           + ("OK: C's prices alone reproduce central dispatch" if same
              else "NOT the same: C's prices do not reproduce central dispatch"))
@@ -448,6 +497,10 @@ def set_start(model, previous):
         old = previous.m.getVarByName(v.VarName)
         if old is not None:
             v.Start = old.X
+    if model.discriminate and not previous.discriminate:   # the uniform price is a valid per-member price
+        for i in model.ids:
+            for t in model.T:
+                model.x[i, t].Start = previous.x[t].X
     if model.soft_ir and model.benchmark is not None:
         for i, w in model.w.items():               # w_i = how much more than alone member i pays at the start
             cost_i = previous.dual_obj[i].getValue()
@@ -466,7 +519,7 @@ def solve_experiment(com, name, method, time_limit, start=None, **options):
         res = model.solve()
     except RuntimeError:
         if model.m.Status == GRB.INFEASIBLE:
-            print(f"=== {name}: INFEASIBLE: no uniform prices satisfy all these requirements ===\n")
+            print(f"=== {name}: INFEASIBLE: no prices satisfy all these requirements ===\n")
             return model, None
         if model.m.Status == GRB.TIME_LIMIT:     # status 9 with no solution at all
             print(f"=== {name}: NO SOLUTION FOUND within {time_limit:g} s (not proven infeasible) ===\n")
@@ -518,11 +571,13 @@ if __name__ == "__main__":
     experiments = {
         "2. + budget balance": dict(budget_balance=True),
         "3. + budget balance + IR": dict(budget_balance=True, benchmark=benchmark),
+                # extension: the same requirements with one price per member (hard IR; soft only if hard finds nothing)
+        "4. per-member prices + BB + IR": dict(budget_balance=True, benchmark=benchmark, discriminate=True),
     }
     previous = model                             # the last solved model (here: cap only), the next one's start
     for name, options in experiments.items():
         model, res = solve_experiment(com, name, args.method, args.time_limit, start=previous, **options)
-        if res is None and "IR" in name:
+        if res is None and "IR" in name and not options.get("soft_ir"):
             # hard IR infeasible (or no solution found): which members block, and how much would they need?
             # Soft IR, started from the budget-balanced solution, which is feasible for it.
             print(f"=== {name}, soft version: who blocks? ===")
@@ -537,6 +592,11 @@ if __name__ == "__main__":
         print(f"community cost: DP {res['cost']:.2f} DKK, C {res_C['cost']:.2f} DKK "
               f"(efficiency loss {res['cost'] - res_C['cost']:.2f} DKK)")
         print("posted prices x_t:", np.round(res["x"], 3))
+        if options.get("discriminate"):                                              # NEW
+            spread = np.max([res["x_member"][i] for i in res["x_member"]], axis=0) - \
+                     np.min([res["x_member"][i] for i in res["x_member"]], axis=0)
+            print("  (average over the members; largest difference between two members' prices per hour:",
+                  np.round(spread, 3), ")")
         print(f"manager: collects {res['collected']:.2f}, pays the DSO {res['paid']:.2f}, "
               f"keeps {res['collected'] - res['paid']:.2f} DKK")
         above = res["above"]
@@ -555,9 +615,9 @@ if __name__ == "__main__":
  
     # ---------------------------------------------------------------- the three experiments side by side
     print(f"=== Summary (IR benchmark: M^{args.benchmark}) ===")
-    print(f"{'experiment':<34}{'cost':>9}{'loss vs C':>11}{'manager keeps':>15}{'members worse off':>19}")
+    print(f"{'experiment':<40}{'cost':>9}{'loss vs C':>11}{'manager keeps':>15}{'members worse off':>19}")
     for name, res in summary.items():
         worse = sum(res["member_cost"][i] > benchmark[i] + 1e-4 for i in benchmark)
-        print(f"{name:<34}{res['cost']:>9.2f}{res['cost'] - res_C['cost']:>11.2f}"
+        print(f"{name:<40}{res['cost']:>9.2f}{res['cost'] - res_C['cost']:>11.2f}"
                f"{res['collected'] - res['paid']:>15.2f}{worse:>19}")   
  
