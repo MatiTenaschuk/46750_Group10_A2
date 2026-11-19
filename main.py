@@ -9,6 +9,10 @@
     python main.py q1 --sensitivity --settlement     # include both Question 1 analyses
     python main.py q2                                # pricing experiments, using I for individual rationality
     python main.py q2 --benchmark R --time-limit 60  # use R and allow 60 seconds per pricing solve
+    
+    
+    ******************* Q2 IS A BIT SLOW IN THE EXPERIMENTS WITH INFEASIBILTY *************************
+    ******************* IF YOU WANT REDUCE THE TIME LIMIT *********************************************
 """
 from __future__ import annotations
 

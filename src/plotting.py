@@ -7,6 +7,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Patch
 
+from matplotlib.colors import Normalize
+from matplotlib.ticker import PercentFormatter, MaxNLocator
+from matplotlib.patches import Patch
+
+
+
+
 # Colours: one fixed colour per model (validated categorical palette), neutral ink for references
 COLORS = {"R": "#2a78d6", "I": "#eb6834", "C": "#1baf7a"}
 STYLES = {"R": "-", "I": "--", "C": "-"}
@@ -246,3 +253,213 @@ def plot_settlement(df, path):
     fig.savefig(f"{path}.png", dpi=200, bbox_inches="tight")
     fig.savefig(f"{path}.pdf", bbox_inches="tight")
     plt.close(fig)
+    
+def plot_Q3_part1_results(profile_results, slope_results, nominal_report, folder="results/q3_step1/figures", show=False, note=None, font_size=11, figure_width=7.2, paper=True):
+    """Visualize costs, constraint exposure, draws and member outcomes.
+
+    The defaults target a full-width LaTeX figure (~7.2 inches). Use PDF at
+    width=\\textwidth. font_size and figure_width control the physical typography
+    and canvas width. paper=False includes explanatory headers and footnotes;
+    paper=True leaves that context to the LaTeX caption. Scenario numbers start
+    at zero, matching the source reports. Both experiments use separate draws.
+
+    Colors identify separate experiments, not paired scenarios. All draws are
+    shown; means/frequencies use scenario probabilities. IR means private cost
+    above the same-realization individual-contract benchmark. Cap exceedance is
+    permitted by the soft contract and charged a penalty. With five scenarios,
+    empirical frequencies have 20-percentage-point resolution. This function
+    compares the specified samples/bounds; it does not rank equally sized risks.
+    Asset markers use the current member-ID suffixes _PV, _B and _PVB.
+    """
+    reports = [profile_results, slope_results]
+    names = ["Profile", "Slope"]
+    colors = ["#267A9B", "#C06434"]
+    nominal_cost = float(nominal_report["summary"]["mean_cost_DKK"])
+    ids = list(profile_results["members"])
+    if set(ids) != set(slope_results["members"]):
+        raise ValueError("Both reports must contain the same members.")
+    for report in reports:
+        rows = report["scenarios"]
+        weights = np.array([r["probability"] for r in rows], dtype=float)
+        if not rows or np.any(weights < 0) or not np.isfinite(weights).all() or not np.isclose(weights.sum(), 1.):
+            raise ValueError("Nonempty reports with valid scenario probabilities required.")
+        if any(set(r["members"]) != set(ids) for r in rows):
+            raise ValueError("Each draw must contain every member.")
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    style = {"font.family": "DejaVu Serif", "font.size": font_size,
+             "axes.titlesize": font_size, "axes.labelsize": font_size,
+             "xtick.labelsize": font_size - 1, "ytick.labelsize": font_size - 1,
+             "legend.fontsize": font_size - 2, "pdf.fonttype": 42,
+             "ps.fonttype": 42, "axes.spines.top": False,
+             "axes.spines.right": False, "axes.edgecolor": "#A6ADB4",
+             "text.color": "#25313C", "axes.labelcolor": "#25313C",
+             "xtick.color": "#46515C", "ytick.color": "#46515C",
+             "axes.labelpad": 3, "savefig.facecolor": "white"}
+
+
+    def tidy(ax, title, ylabel=None):
+        ax.set_title(title, loc="left", fontweight="bold", pad=6)
+        if ylabel:
+            ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=.18)
+        ax.set_axisbelow(True)
+
+    def save(fig, name):
+        fig.canvas.draw()
+        for ext in ("png", "pdf"):
+            path = folder / f"{name}.{ext}"
+            fig.savefig(path, dpi=300, bbox_inches="tight", pad_inches=.035)
+            paths[f"{name}_{ext}"] = path
+
+    footer = "Separate joint draws; prices and optimistic response rule held fixed. Frequencies describe these samples only."
+    if note:
+        footer += "\n" + note
+    with plt.rc_context(style):
+        fig, grid = plt.subplots(3, 2, figsize=(figure_width, 8.3), layout="constrained")
+        fig.set_constrained_layout_pads(w_pad=.03, h_pad=.035, wspace=.04, hspace=.055)
+        # Keep A-F in reading order while retaining the original panel code.
+        axes = np.asarray(grid).reshape(2, 3)
+        if not paper:
+            fig.suptitle(f"Fixed prices under preference uncertainty\nNominal: {nominal_cost:.2f} DKK", fontsize=font_size + 1)
+            fig.supxlabel(footer, fontsize=font_size - 2)
+
+        # A: every scenario, probability-weighted means, and nominal reference.
+        ax = axes[0, 0]
+        tidy(ax, "A  Community cost", "Cost (DKK/day)")
+        for j, report in enumerate(reports):
+            vals = [r["cost_DKK"] for r in report["scenarios"]]
+            jitter = np.linspace(-.12, .12, len(vals))
+            ax.scatter(j + jitter, vals, s=44, color=colors[j], alpha=.85, zorder=3)
+            mean = report["summary"]["mean_cost_DKK"]
+            ax.scatter(j + .24, mean, marker="D", s=60, color=colors[j], edgecolor="white", zorder=4)
+
+        ax.axhline(nominal_cost, color="#53616E", linestyle="--", linewidth=1.1, label="Nominal")
+        ax.set_xticks([0, 1], names)
+        ax.set_xlim(-.45, 1.65)
+        ax.scatter([], [], marker="D", color="#53616E", label="Mean")
+        ax.legend(frameon=False, fontsize=font_size - 2, loc="upper left")
+
+        # B: average economic components; payments are internal transfers.
+        ax = axes[0, 1]
+        tidy(ax, "B  Mean cost components", "Cost (DKK/day)")
+        bottom = np.zeros(2)
+        components = [("mean_energy_DKK", "Energy", "#8BB7C4"), ("mean_tariffs_DKK", "Tariffs", "#D6E0E4"), ("mean_own_cost_DKK", "PV + disutility", "#626F86"), ("mean_penalty_DKK", "Cap penalty", "#D98A5B")]
+        for key, label, color in components:
+            vals = np.array([r["summary"][key] for r in reports])
+            ax.bar([0, 1], vals, bottom=bottom, width=.58, label=label, color=color)
+            bottom += vals
+        for j, value in enumerate(bottom):
+            ax.text(j, value + max(bottom) * .025, f"{value:.2f}", ha="center", fontsize=font_size - 1)
+        ax.set_ylim(0, max(bottom) * 1.48)
+        ax.set_xticks([0, 1], names)
+        ax.legend(frameon=False, fontsize=font_size - 2, ncol=2, loc="upper left")
+
+        # C: preserve both small profile imbalances and very large slope deficits.
+        ax = axes[0, 2]
+        tidy(ax, "C  Manager balance", "Balance (DKK, symlog)")
+        ax.set_yscale("symlog", linthresh=5)
+        ax.set_yticks([-500, -100, -10, 0, 10], ["-500", "-100", "-10", "0", "10"])
+        ax.axhline(0, color="#53616E", linewidth=1)
+        for j, report in enumerate(reports):
+            x = np.arange(len(report["scenarios"])) + (j - .5) * .18
+            y = [r["balance_DKK"] for r in report["scenarios"]]
+            ax.scatter(x, y, s=44, color=colors[j], label=names[j], zorder=3)
+            for xx, yy in (zip(x, y) if len(y) <= 6 else []):
+                ax.annotate(f"{yy:+.1f}", (xx, yy), xytext=(0, 7 if yy >= 0 else -12), textcoords="offset points", ha="center", fontsize=font_size - 2)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
+        ax.set_xlabel("Scenario")
+        ax.margins(y=.22)
+
+        # D: separate equality failures from manager deficits and member losses.
+        ax = axes[1, 0]
+        tidy(ax, "D  Violation frequencies", "Scenario probability")
+        keys = ["BB_frequency", "deficit_frequency", "IR_any_frequency", "cap_frequency"]
+        for j, report in enumerate(reports):
+            vals = [report["summary"][k] for k in keys]
+            bars = ax.bar(np.arange(4) + (j - .5) * .36, vals, width=.34, color=colors[j], label=names[j])
+            for bar, value in zip(bars, vals):
+                ax.annotate(f"{value:.0%}", (bar.get_x() + bar.get_width() / 2, value), xytext=(0, 4 + 11 * j), textcoords="offset points", ha="center", fontsize=font_size - 2)
+        ax.set_xticks(range(4), ["BB", "Deficit", "Any IR", "Cap"])
+        ax.set_ylim(0, 1.30)
+        ax.set_yticks(np.linspace(0, 1, 6))
+        ax.yaxis.set_major_formatter(PercentFormatter(1))
+
+
+        # E: zero cap violations versus large contractual exposure under slope uncertainty.
+        ax = axes[1, 1]
+        tidy(ax, "E  Cap exceedance", "Exceedance (kWh/day)")
+        for j, report in enumerate(reports):
+            vals = [r["exceedance_kWh"] for r in report["scenarios"]]
+            bars = ax.bar(np.arange(len(vals)) + (j - .5) * .36, vals, width=.34, color=colors[j])
+            if len(vals) <= 6:
+                ax.bar_label(bars, labels=[f"{v:.1f}" for v in vals], padding=3, fontsize=font_size - 2)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
+        ax.set_xlabel("Scenario")
+        ax.margins(y=.22)
+
+        # F: magnitudes matter as well as frequencies. No averaging away member losses.
+        ax = axes[1, 2]
+        tidy(ax, "F  Mean positive violations", "DKK per day")
+        for j, report in enumerate(reports):
+            vals = [report["summary"]["mean_deficit_DKK"], report["summary"]["mean_total_IR_violation_DKK"]]
+            bars = ax.bar(np.arange(2) + (j - .5) * .36, vals, width=.34, color=colors[j])
+            ax.bar_label(bars, labels=[f"{v:.3f}" for v in vals], padding=4, fontsize=font_size - 2)
+        ax.set_xticks([0, 1], ["Manager deficit", "Total IR loss"])
+        ax.margins(y=.25)
+        ax.legend(handles=[Patch(facecolor=c, label=n) for c, n in zip(colors, names)],
+                  frameon=False, ncol=2, loc="upper right", fontsize=font_size - 2)
+        save(fig, "part1_overview")
+
+        # Detailed figure: draw-response association and per-member IR exposure.
+        fig2, axes2 = plt.subplots(2, 2, figsize=(figure_width, 7.4),
+                                   gridspec_kw={"height_ratios": [1, 1.8]}, layout="constrained")
+        fig2.set_constrained_layout_pads(w_pad=.03, h_pad=.035, wspace=.035, hspace=.045)
+        if not paper:
+            fig2.suptitle("Member responses and participation", fontsize=font_size + 1)
+        markers = {"Load only": "o", "PV": "s", "Battery": "^", "PV + battery": "D"}
+        def asset(i):
+            return "PV + battery" if i.endswith("_PVB") else "PV" if i.endswith("_PV") else "Battery" if i.endswith("_B") else "Load only"
+        for j, report in enumerate(reports):
+            ax = axes2[0, j]
+            key = "theta_profile" if j == 0 else "theta_cL"
+            tidy(ax, f"{'A' if j == 0 else 'B'}  {names[j]} response", "Load change (kWh/day)")
+            for group, marker in markers.items():
+                points = [d for r in report["scenarios"] for i, d in r["members"].items() if asset(i) == group]
+                if points:
+                    ax.scatter([d[key] for d in points], [d["delta_load_kWh"] for d in points], marker=marker, color=colors[j], s=30, alpha=.6, linewidths=.4, edgecolors="white", label=group)
+            ax.axhline(0, color="#53616E", linewidth=.8)
+            ax.axvline(1, color="#53616E", linestyle="--", linewidth=.8)
+            ax.set_xlabel(r"Profile exponent $\theta$" if j == 0 else r"Disutility multiplier $\theta$")
+            if j == 0:
+                ax.legend(frameon=False, fontsize=font_size - 2, ncol=2,
+                          handletextpad=.3, columnspacing=.6, loc="upper right")
+        for j, (key, title) in enumerate([("IR_frequency", "C  Member IR frequency"), ("mean_IR_violation_DKK", "D  Mean positive IR gap")]):
+            ax = axes2[1, j]
+            data = np.array([[r["members"][i][key] for r in reports] for i in ids])
+            scale = 1.0 if j == 0 else max(float(data.max()), 1e-12)
+            im = ax.imshow(data, cmap="Blues" if j == 0 else "YlOrRd", norm=Normalize(0, scale), aspect="auto")
+            ax.set_title(title, loc="left", fontweight="bold", pad=6)
+            ax.set_xticks([0, 1], names)
+            ax.set_yticks(range(len(ids)), ids)
+            ax.tick_params(length=0)
+            for a in range(len(ids)):
+                for b in range(2):
+                    value = data[a, b]
+                    text = f"{value:.0%}" if j == 0 else f"{value:.3f}"
+                    ax.text(b, a, text, ha="center", va="center", fontsize=font_size - 2, color="white" if value > .6 * scale else "#25313C")
+            colorbar = fig2.colorbar(im, ax=ax, fraction=.045, pad=.04)
+            if j == 0:
+                colorbar.ax.yaxis.set_major_formatter(PercentFormatter(1))
+            else:
+                colorbar.set_label("Mean positive gap (DKK/day)", fontsize=font_size - 2)
+        if not paper:
+            fig2.supxlabel("IR benchmark: each draw's individual contract.\n" + (note or "Separate draws; prices and response rule fixed."), fontsize=font_size - 2)
+        save(fig2, "part1_members")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+            plt.close(fig2)
+    return paths
